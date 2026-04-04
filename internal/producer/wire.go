@@ -3,11 +3,13 @@ package producer
 import (
 	"context"
 	"crypto/rand"
+	"log"
 	"math/big"
 	"sync/atomic"
 	"time"
 
 	"github.com/TFMV/arrowflow/internal/config"
+	"github.com/TFMV/arrowflow/internal/metrics"
 	pb "github.com/TFMV/arrowflow/internal/schemas/pb"
 	"github.com/TFMV/arrowflow/internal/stream"
 	"google.golang.org/protobuf/proto"
@@ -237,15 +239,18 @@ func (wp *WireProducer) emitBatch(count int) error {
 			continue
 		}
 
+		start := time.Now()
 		err = wp.publisher.Publish(wp.ctx, wp.topic, &stream.Msg{
 			Key:     []byte(generateKey()),
 			Payload: wireBytes,
 		})
 		if err != nil {
 			wp.stats.errors.Add(1)
+			log.Printf("[PRODUCER] Publish error: %v", err)
 			continue
 		}
 
+		metrics.RecordLatency("produce", start)
 		wp.stats.messages.Add(1)
 		wp.stats.bytes.Add(int64(len(wireBytes)))
 	}
@@ -357,11 +362,17 @@ func should(prob float32) bool {
 }
 
 func randInt(min, max int) int {
+	if max <= min {
+		return min
+	}
 	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min)))
 	return int(n.Int64()) + min
 }
 
 func randInt64(min, max int64) int64 {
+	if max <= min {
+		return min
+	}
 	n, _ := rand.Int(rand.Reader, big.NewInt(max-min))
 	return n.Int64() + min
 }
