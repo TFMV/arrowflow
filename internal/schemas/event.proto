@@ -1,0 +1,240 @@
+syntax = "proto3";
+
+package arrowflow;
+
+option go_package = "github.com/TFMV/arrowflow/internal/schemas/pb";
+
+message Event {
+  string schema_version = 1;
+  int64 event_timestamp = 2;
+
+  UserContext user = 10;
+  SessionContext session = 11;
+  TracingContext tracing = 12;
+
+  Payload payload = 20;
+  Enrichment enrichment = 21;
+
+  repeated Metric metrics = 30;
+  repeated Tag tags = 31;
+
+  message UserContext {
+    string user_id = 1;
+    string session_id = 2;
+    string device_id = 3;
+    string ip_address = 4;
+    string user_agent = 5;
+    map<string, string> attributes = 6;
+
+    Profile profile = 10;
+
+    message Profile {
+      string email = 1;
+      string username = 2;
+      repeated string roles = 3;
+      map<string, string> preferences = 4;
+
+      Account account = 10;
+
+      message Account {
+        string account_id = 1;
+        string tier = 2;
+        int64 created_at = 3;
+        repeated string permissions = 4;
+        map<string, string> metadata = 5;
+
+        Billing billing = 10;
+
+        message Billing {
+          string payment_method = 1;
+          string currency = 2;
+          repeated Invoice invoices = 3;
+
+          message Invoice {
+            string invoice_id = 1;
+            int64 amount = 2;
+            string status = 3;
+            repeated LineItem items = 4;
+
+            message LineItem {
+              string sku = 1;
+              string description = 2;
+              int64 quantity = 3;
+              int64 unit_price = 4;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  message SessionContext {
+    string session_id = 1;
+    int64 started_at = 2;
+    int64 last_activity = 3;
+    string entry_url = 4;
+    repeated string referrers = 5;
+    map<string, string> session_data = 6;
+
+    Navigation navigation = 10;
+
+    message Navigation {
+      repeated PageView page_views = 1;
+      repeated ClickEvent clicks = 2;
+      repeated ErrorEvent errors = 3;
+
+      message PageView {
+        string url = 1;
+        string title = 2;
+        int64 timestamp = 3;
+        int32 duration_ms = 4;
+        string referrer = 5;
+        map<string, string> params = 6;
+      }
+
+      message ClickEvent {
+        string element_id = 1;
+        string element_type = 2;
+        string xpath = 3;
+        int32 x = 4;
+        int32 y = 5;
+        int64 timestamp = 6;
+        map<string, string> data = 7;
+      }
+
+      message ErrorEvent {
+        string error_type = 1;
+        string message = 2;
+        string stack_trace = 3;
+        int64 timestamp = 4;
+        map<string, string> context = 5;
+      }
+    }
+  }
+
+  message TracingContext {
+    string trace_id = 1;
+    string span_id = 2;
+    string parent_span_id = 3;
+    string service_name = 4;
+    string operation_name = 5;
+    int64 start_time = 6;
+    int64 duration_ns = 7;
+    map<string, string> tags = 8;
+    repeated SpanAnnotation annotations = 9;
+
+    message SpanAnnotation {
+      string key = 1;
+      string value = 2;
+      int64 timestamp = 3;
+    }
+  }
+
+  message Payload {
+    string event_type = 1;
+    bytes raw_data = 2;
+    string json_blob = 3;
+    map<string, string> metadata = 4;
+    repeated CustomField custom_fields = 5;
+
+    message CustomField {
+      string name = 1;
+      string value = 2;
+      FieldType type = 3;
+
+      enum FieldType {
+        STRING = 0;
+        NUMBER = 1;
+        BOOLEAN = 2;
+        JSON = 3;
+        BINARY = 4;
+      }
+    }
+  }
+
+  message Enrichment {
+    Geolocation geo = 1;
+    UserAgentInfo ua = 2;
+    DeviceInfo device = 3;
+    ServerInfo server = 4;
+    ABTest ab_test = 5;
+    FraudDetection fraud = 6;
+
+    message Geolocation {
+      string country = 1;
+      string region = 2;
+      string city = 3;
+      string timezone = 4;
+      double latitude = 5;
+      double longitude = 6;
+      string isp = 7;
+      string asn = 8;
+      map<string, string> extra = 9;
+    }
+
+    message UserAgentInfo {
+      string browser = 1;
+      string browser_version = 2;
+      string os = 3;
+      string os_version = 4;
+      string device_type = 5;
+      string device_brand = 6;
+      string device_model = 7;
+      bool is_mobile = 8;
+      bool is_bot = 9;
+      map<string, string> raw_headers = 10;
+    }
+
+    message DeviceInfo {
+      string device_id = 1;
+      string device_type = 2;
+      string os = 3;
+      string os_version = 4;
+      string screen_resolution = 5;
+      int32 screen_width = 6;
+      int32 screen_height = 7;
+      int32 color_depth = 8;
+      bool is_tablet = 9;
+      bool is_mobile = 10;
+      map<string, string> capabilities = 11;
+    }
+
+    message ServerInfo {
+      string server_name = 1;
+      string datacenter = 2;
+      string region = 3;
+      string cluster = 4;
+      map<string, string> tags = 5;
+      repeated string available_services = 6;
+    }
+
+    message ABTest {
+      string experiment_id = 1;
+      string variant_id = 2;
+      string experiment_name = 3;
+      string variant_name = 4;
+      double traffic_allocation = 5;
+      map<string, string> parameters = 6;
+    }
+
+    message FraudDetection {
+      int32 risk_score = 1;
+      string risk_level = 2;
+      repeated string flags = 3;
+      map<string, string> signals = 4;
+    }
+  }
+
+  message Metric {
+    string name = 1;
+    double value = 2;
+    string unit = 3;
+    int64 timestamp = 4;
+    map<string, string> labels = 5;
+  }
+
+  message Tag {
+    string key = 1;
+    string value = 2;
+  }
+}
