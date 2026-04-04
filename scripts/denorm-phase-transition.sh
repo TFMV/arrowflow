@@ -2,8 +2,6 @@
 # denorm-phase-transition.sh
 # Find where denormalized row expansion grows faster than input rate
 
-set -e
-
 echo "=== Finding Denorm Phase Transition ==="
 echo "This experiment measures where fan-out becomes nonlinear"
 echo ""
@@ -16,11 +14,20 @@ for RATE in 1000 5000 10000 25000 50000 75000 100000; do
   
   RESULT_FILE="$RESULTS_DIR/rate-${RATE}.txt"
   
-  timeout 30s ./bin/arrowflow experiment \
+  ./bin/arrowflow experiment \
     --mode direct \
     --rate $RATE \
     --duration 20s \
-    --workers 8 2>&1 | tee "$RESULT_FILE"
+    --workers 8 2>&1 | tee "$RESULT_FILE" &
+  
+  PID=$!
+  
+  # Wait for duration + buffer
+  sleep 25
+  
+  # Kill if still running
+  kill $PID 2>/dev/null || true
+  wait $PID 2>/dev/null || true
   
   # Extract key metrics
   RATE_OBSERVED=$(grep "Rate:" "$RESULT_FILE" | awk '{print $2}' || echo "0")
@@ -33,7 +40,7 @@ for RATE in 1000 5000 10000 25000 50000 75000 100000; do
   
   # Check telemetry for memory behavior
   if [ -f telemetry.json ]; then
-    HEAP=$(cat telemetry.json | grep -o '"heap_alloc_mb":[0-9.]*' | tail -1 || echo "N/A")
+    HEAP=$(grep -o '"heap_alloc_mb":[0-9.]*' telemetry.json | tail -1 || echo "N/A")
     echo "  Memory: $HEAP"
   fi
   echo ""
@@ -41,7 +48,7 @@ done
 
 echo "=== Phase Transition Analysis ==="
 echo "Compare output rates vs input rates:"
-echo "  - Linear regime: output_rate ≈ input_rate × fan-out (constant)"
+echo "  - Linear regime: output_rate ≈ input_rate x fan-out (constant)"
 echo "  - Transition: output_rate begins accelerating"
 echo "  - Explosion: output_rate >> input_rate (unstable)"
 echo ""
