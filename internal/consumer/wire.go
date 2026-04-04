@@ -18,6 +18,7 @@ import (
 	ba "github.com/loicalleyne/bufarrowlib"
 	"github.com/loicalleyne/bufarrowlib/proto/pbpath"
 	"google.golang.org/protobuf/proto"
+	"time"
 )
 
 type OutputMode int
@@ -79,8 +80,6 @@ var DefaultConsumerConfig = ConsumerConfig{
 }
 
 func NewWireConsumer(s stream.Subscriber, cfg *config.Config, cc ConsumerConfig) (*WireConsumer, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-
 	protoPath := "./internal/schemas/event.proto"
 	fd, err := ba.CompileProtoToFileDescriptor(protoPath, []string{"."})
 	if err != nil {
@@ -123,6 +122,7 @@ func NewWireConsumer(s stream.Subscriber, cfg *config.Config, cc ConsumerConfig)
 		transcoders = append(transcoders, clone)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
 	return &WireConsumer{
 		subscriber:  s,
 		cfg:         cfg,
@@ -189,6 +189,7 @@ func (wc *WireConsumer) processWorker(workerID int) {
 	defer tc.Release()
 
 	var batchCount int
+	var msgCount int
 	for raw := range wc.inputChan {
 		var err error
 		switch wc.outputMode {
@@ -203,14 +204,17 @@ func (wc *WireConsumer) processWorker(workerID int) {
 			continue
 		}
 
-		if tc.NewRecordBatch().NumRows() >= int64(wc.batchSize) {
+		msgCount++
+		if msgCount >= wc.batchSize {
 			var rec arrow.RecordBatch
+			startBatch := time.Now()
 			switch wc.outputMode {
 			case OutputModeDenorm:
 				rec = tc.NewDenormalizerRecordBatch()
 			default:
 				rec = tc.NewRecordBatch()
 			}
+			metrics.RecordLatency("batch_output", startBatch)
 
 			if rec.NumRows() > 0 {
 				metrics.BytesConsumed.Add(float64(rec.NumRows() * rec.NumCols() * 100))
@@ -220,10 +224,13 @@ func (wc *WireConsumer) processWorker(workerID int) {
 				batchCount++
 			}
 			rec.Release()
+			msgCount = 0
 		}
 	}
 
 	finalBatch := func() arrow.RecordBatch {
+		startFinalBatch := time.Now()
+		defer func() { metrics.RecordLatency("batch_output", startFinalBatch) }()
 		switch wc.outputMode {
 		case OutputModeDenorm:
 			return tc.NewDenormalizerRecordBatch()

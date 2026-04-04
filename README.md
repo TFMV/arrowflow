@@ -1,6 +1,6 @@
 # ArrowFlow: Streaming Protobuf → Arrow Pipeline
 
-A scientific evaluation harness for measuring bufarrowlib under realistic streaming pressure. Designed to find phase transitions, crossover points, and stability boundaries in the ingestion pipeline.
+A scientific evaluation harness for measuring `bufarrowlib` under realistic streaming pressure. Designed to identify **phase transitions**, **crossover points**, and **stability boundaries** in the ingestion pipeline.
 
 ## Quick Start
 
@@ -8,8 +8,11 @@ A scientific evaluation harness for measuring bufarrowlib under realistic stream
 # Build all binaries
 make build
 
-# Verify CLI
-./bin/arrowflow -h
+# Start NATS server with JetStream enabled
+docker run -d -p 4222:4222 --name nats nats:latest -js
+
+# Run the full automated evaluation suite
+./scripts/run-all-experiments.sh
 ```
 
 ## Architecture Overview
@@ -23,7 +26,7 @@ make build
 │  ───────                ──────              ────────           ──────       │
 │                                                                             │
 │  ┌─────────┐      ┌─────────────┐      ┌─────────────┐    ┌─────────────┐   │
-│  │ Wire    │─────▶│  NATS/      │─────▶│ bufarrowlib │────▶│ RecordBatch│   │
+│  │ Wire    │─────▶│  NATS/      │─────▶│ bufarrowlib │───▶│ RecordBatch │   │
 │  │ Bytes   │      │  Kafka      │      │ Decoder     │    │ Output      │   │
 │  └─────────┘      └─────────────┘      └─────────────┘    └─────────────┘   │
 │       │                                      │                              │
@@ -38,299 +41,111 @@ make build
 
 ## CLI Usage
 
+ArrowFlow provides several specialized subcommands for performance characterization:
+
 ```bash
-# Producer - generates raw protobuf wire bytes
-./bin/arrowflow producer --rate 100000 --mode burst
+# Experiment - multi-dimensional scientific analysis
+./bin/arrowflow experiment \
+  --mode stream \
+  --rate 50000 \
+  --duration 20s \
+  --batch-size 1000 \
+  --size-dist heavy-tail \
+  --denorm=true \
+  --hyper=true
 
-# Consumer - decodes via bufarrowlib with optional HyperType
-./bin/arrowflow consumer --batch-size 1024 --hypertype
-
-# Benchmark - throughput stress test
-./bin/arrowflow benchmark --mode stress --duration 10m
-
-# Experiment - scientific analysis modes
-./bin/arrowflow experiment --mode direct --rate 50000
-
-# Chaos - failure injection
-./bin/arrowflow chaos --rate 10000 --chaos-burst
+# Chaos - failure and skew injection
+./bin/arrowflow chaos \
+  --rate 10000 \
+  --duration 1m \
+  --chaos-burst \
+  --chaos-schema \
+  --chaos-hot-partition \
+  --chaos-size-shock
 ```
+
+### Key Flags:
+| Flag | Description | Values |
+| :--- | :--- | :--- |
+| `--mode` | Execution mode | `stream` (NATS), `direct` (In-process) |
+| `--size-dist` | Message size profile | `small`, `medium`, `large`, `heavy-tail` |
+| `--denorm` | Structural mode | `true` (Flat Arrow), `false` (Nested Arrow) |
+| `--batch-size` | Buffering threshold | Rows before Arrow emission (e.g., 100, 1000, 10000) |
+| `--hyper` | Enable HyperType | JIT-compiled Protobuf decoding |
 
 ---
 
-# SCIENTIFIC EXPERIMENTS
+# SCIENTIFIC EVALUATION
 
-This section contains reproducible experiments to answer the critical analysis questions.
+ArrowFlow is built to answer six fundamental questions about the ingestion pipeline. These are automated in the `./scripts/run-all-experiments.sh` suite.
 
-## Prerequisites
+## The 6-Phase Evaluation Suite
 
-```bash
-# Start NATS server WITH JetStream enabled (required for streaming)
-docker run -d -p 4222:4222 --name nats nats:latest -js
+### Phase 1: HyperType Crossover Point
+**Goal**: Identify where HyperType's JIT overhead outweighs its benefits.
+- **Method**: Compares baseline vs HyperType across `small`, `medium`, `large`, and `heavy-tail` distributions.
+- **Outcome**: Documents the payload size crossover where JIT parsing becomes 4x+ faster than standard decoding.
 
-# Or enable JetStream in an existing container
-# docker exec nats nats-server -js
+### Phase 2: Batch Size & GC Optimization
+**Goal**: Find the "sweet spot" for row buffering.
+- **Method**: Sweeps batch sizes from 100 to 10,000 rows.
+- **Metric**: Monitors `GC Count` vs `Consumption Latency`.
 
-# Verify JetStream is available
-docker exec nats nats-cli -s localhost:4222 jetstream streams ls
+### Phase 3: Structural Cost (Denorm vs Nested)
+**Goal**: Quantify the cost of flat Arrow denormalization.
+- **Method**: Compares `denorm=true` vs `denorm=false` at high rates.
+- **Metric**: Uses `Expansion Factor` and `Fan-out Multiplier` to measure row inflation.
 
-# Set environment variables
-export NATS_URL="nats://localhost:4222"
-export TOPIC="arrowflow.test"
-```
+### Phase 4: Throughput Saturation (Finding the Plateau)
+**Goal**: Identify the hardware/environment bottleneck.
+- **Method**: Rate sweep from 10,000 to 200,000 msg/s.
+- **Metric**: Finds where `Observed Rate` plateaus and `Consumer Lag` spikes.
 
----
+### Phase 5: Worker Scaling Efficiency
+**Goal**: Measure parallelism scaling limits.
+- **Method**: Scales processing workers from 2 to 16.
 
-## Experiment 1: Find Denorm Phase Transition Point
-
-**Goal**: Identify where denormalized row expansion grows faster than input rate.
-
-### Method
-Run at increasing input rates with denorm enabled, measure:
-- Input message rate
-- Output row rate (rows = messages × fan-out multiplier)
-- Memory allocation rate
-
-### Reproduction
-
-Run the provided script:
-
-```bash
-./scripts/denorm-phase-transition.sh
-```
-
-Or run manually using background processes:
-
-```bash
-for RATE in 1000 5000 10000 25000 50000 75000 100000; do
-  echo "Testing rate: $RATE"
-  ./bin/arrowflow experiment --mode direct --rate $RATE --duration 20s --workers 8 &
-  PID=$!
-  sleep 25
-  kill $PID 2>/dev/null || true
-  wait $PID 2>/dev/null || true
-done
-```
-
-### Expected Observations
-- **Linear regime**: Output rows grow linearly with input (fan-out ~1-2x)
-- **Transition point**: When repeated fields expand, output rate accelerates
-- **Explosion point**: Output rate >> input rate, memory grows superlinearly
+### Phase 6: Chaos & Stability Boundary
+**Goal**: Test system recovery under adverse conditions.
+- **Method**: Sustained 1-minute run with bursts, schema evolution, and partition skew enabled.
 
 ---
 
-## Experiment 2: HyperType Crossover Threshold
+## Interpreting Telemetry
 
-**Goal**: Find where HyperType optimization overhead exceeds benefit.
+Hardened telemetry provides three new specialized sections for scientific analysis:
 
-### Method
-Compare performance with and without HyperType at different:
-- Message sizes
-- Schema complexities
-- Input rates
+### 1. Arrow Integration Metrics
+Found in the `Arrow Integration` section of the report and `results.csv`:
+- **Expansion**: Measures column complexity (cols/row).
+- **Denorm Fan-out**: The ratio of input messages to output rows (multi-row expansion).
+- **Avg Batch**: Actual rows and KB per emitted RecordBatch.
 
-### Reproduction
+### 2. Streaming Performance
+- **Consumer Lag**: Messages pending in the broker.
+- **Buffer Depth**: Messages pending in the internal transcoder buffer.
+- **Peak Metrics**: Evaluates stability boundaries by tracking the highest recorded lag/depth.
 
-```bash
-./scripts/hypertype-crossover.sh
-```
+### 3. Latency Characterization
+Standardized to **nanoseconds (ns)** across all reports:
+- **Produce**: Network/Broker entry latency.
+- **Consume**: Ingestion and Transcoding latency.
+- **Batch Output**: Arrow record serialization and emission time.
 
-Or run manually:
-
-```bash
-# Without HyperType
-./bin/arrowflow experiment --mode direct --rate 10000 --duration 20s --hyper=false &
-PID=$!
-sleep 25
-kill $PID 2>/dev/null || true
-wait $PID 2>/dev/null || true
-
-# With HyperType
-./bin/arrowflow experiment --mode direct --rate 10000 --duration 20s --hyper=true &
-PID=$!
-sleep 25
-kill $PID 2>/dev/null || true
-wait $PID 2>/dev/null || true
-```
-
-### Expected Results
-- **Small messages**: HyperType overhead may exceed benefit (compilation cost > parse savings)
-- **Large messages**: HyperType provides clear benefit
-- **High rate**: HyperType PGO recompilation may show staged improvements
-
----
-
-## Experiment 3: GC Phase Shifts by Batch Size
-
-**Goal**: Find batch sizes where GC behavior changes dramatically.
-
-### Reproduction
-
-```bash
-./scripts/gc-phase-shifts.sh
-```
-
-Or run manually:
-
-```bash
-for BATCH in 100 500 1000 5000 10000; do
-  echo "Testing batch: $BATCH"
-  ./bin/arrowflow consumer --batch-size $BATCH --workers 4 &
-  PID=$!
-  sleep 15
-  kill $PID 2>/dev/null || true
-  wait $PID 2>/dev/null || true
-done
-```
-
-### Expected Signatures
-| Batch Size | Behavior | Dominated By |
-|------------|----------|--------------|
-| 1-100 | High GC frequency | CPU/GC |
-| 100-1000 | Balanced | - |
-| 10000+ | GC spikes | Memory/GC collapse |
-
----
-
-## Experiment 4: Denorm Structural Explosion
-
-**Goal**: Detect threshold where denorm becomes unstable.
-
-### Reproduction
-
-```bash
-./scripts/denorm-explosion.sh
-```
-
-Or run manually:
-
-```bash
-for RATE in 10000 20000 30000; do
-  echo "Testing rate: $RATE"
-  ./bin/arrowflow experiment --mode direct --rate $RATE --duration 15s &
-  PID=$!
-  sleep 20
-  kill $PID 2>/dev/null || true
-  wait $PID 2>/dev/null || true
-done
-```
-
-### Warning Signs
-- Fan-out multiplier becomes variable
-- Latency distribution becomes bimodal (two peaks)
-- Cache miss rate spikes
-- Memory grows non-linearly
-
----
-
-## Run All Experiments
-
-```bash
-./scripts/run-all-experiments.sh
-```
-
-This will:
-1. Run baseline with HyperType
-2. Run baseline without HyperType  
-3. Sweep batch sizes (100, 500, 1000, 5000, 10000)
-4. Run stress collapse test
-5. Run chaos injection
-6. Sweep rates (10K, 25K, 50K, 75K, 100K)
-
-Results are saved to `experiment-results/`
-
----
-
-## Interpreting Results
-
-### Key Questions to Answer
-
-| Question | How to Find Answer |
-|----------|-------------------|
-| Where does throughput saturate? | Run stress test, find plateau |
-| What dominates cost? | Compare baseline vs denorm vs hyper |
-| When does HyperType fail? | Compare with/without at varying sizes |
-| Optimal batch size? | Sweep batch sizes, find GC minimum |
-| Denorm linear or phase-transition? | Measure fan-out ratio vs input rate |
-| Stability boundary? | Chaos injection + stress collapse |
-
-### Phase Transition Signatures
-
-**Denorm Phase Transition**:
-```
-Linear:    rows/sec ≈ messages/sec × fan-out (constant)
-Transition: rows/sec begins accelerating  
-Explosion: rows/sec >> messages/sec (unstable)
-```
-
-**HyperType Crossover**:
-```
-Beneficial: hypertype_time < baseline_time
-Break-even: hypertype_time ≈ baseline_time  
-Harmful:    hypertype_time > baseline_time (compilation overhead)
-```
-
-**GC Phase Shift**:
-```
-Smooth:    pause_time grows linearly with batch_size
-Jump:      pause_time spikes at specific batch thresholds
-Collapse:  pause_time dominates latency at large batches
-```
-
----
-
-## Configuration Reference
-
-### Environment Variables
-
-```bash
-# Stream configuration
-export STREAM_BACKEND="nats"           # nats or kafka
-export NATS_URL="nats://localhost:4222"
-export TOPIC="arrowflow.test"
-export CONSUMER_GROUP="arrowflow-group"
-
-# Producer configuration  
-export BATCH_SIZE=1000
-export BUFFER_SIZE_BYTES=1048576
-```
-
-### Metric Output
-
-Results are written to:
-- `telemetry.json` - Real-time metrics in JSON format
-- Console - Live summary printed on exit
-- Prometheus - Available on `:9090/metrics` (if enabled)
-- CSV files - In `results/` directory for each experiment
+## Evaluation Results
+All results are automatically aggregated into:
+- `results/all-experiments/results.csv`: A machine-readable matrix of all phases.
+- `results/all-experiments/*.txt`: Human-readable summaries for individual trials.
 
 ---
 
 ## Troubleshooting
 
-### "nats: no response from stream" / High produce latency
-**Cause**: NATS JetStream is not enabled or streams are not configured.
+### "nats: no response from stream"
+Ensure NATS is started with `-js` (JetStream enabled).
 
-**Solution**:
-```bash
-# Restart NATS with JetStream enabled
-docker rm -f nats
-docker run -d -p 4222:4222 --name nats nats:latest -js
+### Metrics show 0 for consumption
+Ensure you are using `--mode stream` if testing with the NATS broker. For internal stress tests, use `--mode direct`.
 
-# Create stream manually if needed
-docker exec nats nats-cli -s localhost:4222 \
-  stream add ARROWFLOW --subjects arrowflow.test --storage memory
-```
-
-### High Latency
-- Reduce batch size
-- Disable HyperType (for small messages)
-- Enable more workers
-
-### GC Thrashing
-- Increase batch size
-- Reduce worker count
-- Enable HyperType (reduces allocation churn)
-
-### Memory Explosion
-- Check for denorm fan-out explosion
-- Reduce repeated field cardinality in test data
-- Enable batch limits
+### High GC overhead
+Increase `--batch-size` or enable `--hyper=true` to reduce allocation frequency.

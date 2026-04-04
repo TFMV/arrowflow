@@ -1,0 +1,36 @@
+2026/04/04 16:15:00 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
+2026/04/04 16:15:00 Chaos Producer: rate=25000, mode=burst, workers=8, hyper=true
+Chaos Results:
+  Messages (Produced): 43036
+  Messages (Consumed): 43019
+  Bytes: 400298845
+  Injections: 0
+  Bursts: 0
+  Schema Swaps: 0
+=== ArrowFlow Telemetry Report ===
+Timestamp: 2026-04-04T16:15:22-05:00
+
+Throughput:
+  Messages/sec: 0.00
+  Bytes/sec:    0.00 MB/s
+  Total:        0 messages, 0.00 MB
+
+Latency (ns):
+  Produce:      mean=167616, p50=152709, p95=237333, p99=298417, p99.9=881500
+  Consume:      mean=4879, p50=3583, p95=9459, p99=29833, p99.9=108541
+  Batch Output: mean=6436, p50=4583, p95=5916, p99=76500, p99.9=76500
+
+Memory:
+  Heap Alloc:  11.11 MB
+  Heap In Use: 13.03 MB
+  GCs:         1698
+  GC Pause:    0.03 ms
+
+Arrow Integration:
+  Avg Batch:     0 rows (0.00 KB)
+  Expansion:     0.00 cols/row
+  Denorm Fanout: 0.00 multiplier
+
+Streaming:
+  Consumer Lag: 0 (Peak: 0)
+  Buffer Depth: 0 (Peak: 3)

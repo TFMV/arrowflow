@@ -1,0 +1,37 @@
+[DEBUG] mode=stream, rate=50000, workers=8, duration=15s, hyper=true
+2026/04/04 16:10:51 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
+2026/04/04 16:10:51 Experiment: mode=stream, rate=50000, workers=8, duration=15s
+2026/04/04 16:10:51 Running Stream Experiment (NATS): rate=50000, duration=15s, workers=8, batch=1000, dist=heavy-tail, denorm=true
+2026/04/04 16:10:51 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
+Experiment Results (NATS):
+  Mode: stream
+  Duration: 17.001110375s
+  Messages: 29510
+  Rate: 1735.77 msg/s
+=== ArrowFlow Telemetry Report ===
+Timestamp: 2026-04-04T16:11:08-05:00
+
+Throughput:
+  Messages/sec: 1734.15
+  Bytes/sec:    15.42 MB/s
+  Total:        29510 messages, 262.38 MB
+
+Latency (ns):
+  Produce:      mean=190584, p50=161458, p95=322834, p99=507709, p99.9=1983084
+  Consume:      mean=6785, p50=4167, p95=19667, p99=41583, p99.9=146541
+  Batch Output: mean=8511, p50=5958, p95=16375, p99=67417, p99.9=67417
+
+Memory:
+  Heap Alloc:  6.68 MB
+  Heap In Use: 8.73 MB
+  GCs:         1110
+  GC Pause:    0.02 ms
+
+Arrow Integration:
+  Avg Batch:     1000 rows (0.00 KB)
+  Expansion:     0.00 cols/row
+  Denorm Fanout: 1.00 multiplier
+
+Streaming:
+  Consumer Lag: 0 (Peak: 0)
+  Buffer Depth: 0 (Peak: 3)

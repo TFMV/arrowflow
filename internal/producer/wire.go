@@ -78,10 +78,14 @@ var DefaultWireConfig = WireConfig{
 
 func NewWireProducer(p stream.Publisher, cfg *config.Config, wc WireConfig) *WireProducer {
 	ctx, cancel := context.WithCancel(context.Background())
+	topic := "arrowflow-events"
+	if cfg != nil {
+		topic = cfg.Topic
+	}
 	return &WireProducer{
 		publisher:     p,
 		cfg:           cfg,
-		topic:         cfg.Topic,
+		topic:         topic,
 		mode:          parseMode(wc.Mode),
 		sizeDist:      parseSizeDist(wc.SizeDist),
 		rate:          wc.Rate,
@@ -232,7 +236,7 @@ func sinApprox(x float64) float64 {
 
 func (wp *WireProducer) emitBatch(count int) error {
 	for i := 0; i < count; i++ {
-		msg := wp.generateWireMessage()
+		msg := wp.GenerateWireMessage()
 		wireBytes, err := proto.Marshal(msg)
 		if err != nil {
 			wp.stats.errors.Add(1)
@@ -257,7 +261,7 @@ func (wp *WireProducer) emitBatch(count int) error {
 	return nil
 }
 
-func (wp *WireProducer) generateWireMessage() *pb.Event {
+func (wp *WireProducer) GenerateWireMessage() *pb.Event {
 	cfg := stressConfig
 	switch wp.sizeDist {
 	case SizeSmall:
