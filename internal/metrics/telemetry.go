@@ -51,16 +51,16 @@ func (h *Histogram) Observe(v float64) {
 	defer h.mu.Unlock()
 
 	h.vals = append(h.vals, v)
-	h.sum.Add(int64(v * 1000000))
+	h.sum.Add(int64(v * 1000000000))
 	h.count.Add(1)
 
 	oldMin := h.min.Load()
-	if oldMin == 0 || int64(v*1000000) < oldMin {
-		h.min.Store(int64(v * 1000000))
+	if oldMin == 0 || int64(v*1000000000) < oldMin {
+		h.min.Store(int64(v * 1000000000))
 	}
 	oldMax := h.max.Load()
-	if int64(v*1000000) > oldMax {
-		h.max.Store(int64(v * 1000000))
+	if int64(v*1000000000) > oldMax {
+		h.max.Store(int64(v * 1000000000))
 	}
 
 	if len(h.vals) > h.size {
@@ -75,9 +75,9 @@ func (h *Histogram) Stats() (count, min, max, mean, p50, p95, p99, p999 float64)
 		return
 	}
 
-	min = float64(h.min.Load()) / 1000000
-	max = float64(h.max.Load()) / 1000000
-	mean = float64(h.sum.Load()) / 1000000 / count
+	min = float64(h.min.Load()) / 1000000000
+	max = float64(h.max.Load()) / 1000000000
+	mean = float64(h.sum.Load()) / 1000000000 / count
 
 	if len(h.vals) > 0 {
 		sorted := make([]float64, len(h.vals))
@@ -115,19 +115,43 @@ func quickSort(a []float64) {
 }
 
 type Gauge struct {
-	val int64
+	val  int64
+	peak int64
 }
 
 func (g *Gauge) Set(v float64) {
-	atomic.StoreInt64(&g.val, int64(v))
+	iv := int64(v)
+	atomic.StoreInt64(&g.val, iv)
+	for {
+		p := atomic.LoadInt64(&g.peak)
+		if iv <= p {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&g.peak, p, iv) {
+			break
+		}
+	}
 }
 
 func (g *Gauge) Add(v float64) {
-	atomic.AddInt64(&g.val, int64(v))
+	newVal := atomic.AddInt64(&g.val, int64(v))
+	for {
+		p := atomic.LoadInt64(&g.peak)
+		if newVal <= p {
+			break
+		}
+		if atomic.CompareAndSwapInt64(&g.peak, p, newVal) {
+			break
+		}
+	}
 }
 
 func (g *Gauge) Get() float64 {
 	return float64(atomic.LoadInt64(&g.val))
+}
+
+func (g *Gauge) GetPeak() float64 {
+	return float64(atomic.LoadInt64(&g.peak))
 }
 
 var consumerLag Gauge
@@ -322,16 +346,16 @@ func init() {
 }
 
 func RecordLatency(name string, start time.Time) {
-	duration := time.Since(start).Microseconds()
-	globalLatency.Observe(name, float64(duration)/1000000)
+	duration := time.Since(start).Nanoseconds()
+	globalLatency.Observe(name, float64(duration)/1000000000)
 
 	switch name {
 	case "produce":
-		ProduceLatencyMs.Observe(float64(duration) / 1000)
+		ProduceLatencyMs.Observe(float64(duration) / 1000000)
 	case "consume":
-		ConsumeLatencyMs.Observe(float64(duration) / 1000)
+		ConsumeLatencyMs.Observe(float64(duration) / 1000000)
 	case "batch_output":
-		BatchOutputLatencyMs.Observe(float64(duration) / 1000)
+		BatchOutputLatencyMs.Observe(float64(duration) / 1000000)
 	}
 }
 
@@ -349,14 +373,20 @@ func RecordBatchMetrics(rows, cols int, sizeBytes int64, denormRows int) {
 	RecordBatchSize.Observe(float64(sizeBytes))
 	RecordBatchRows.Observe(float64(rows))
 
+	// Record to internal Stats for GenerateTelemetryReport
+	globalLatency.Observe("batch_size_bytes", float64(sizeBytes))
+	globalLatency.Observe("batch_rows", float64(rows))
+
 	if cols > 0 && rows > 0 {
 		expansion := float64(cols) / float64(rows)
 		ColumnExpansionFactor.Observe(expansion)
+		globalLatency.Observe("column_expansion", expansion)
 	}
 
 	if denormRows > 0 {
-		fanout := float64(denormRows)
+		fanout := float64(denormRows) / float64(rows)
 		DenormFanoutMultiplier.Observe(fanout)
+		globalLatency.Observe("denorm_fanout", fanout)
 	}
 }
 
@@ -420,11 +450,11 @@ type LatencyStats struct {
 
 type LatencyPercentiles struct {
 	Count float64 `json:"count"`
-	Mean  float64 `json:"mean_ms"`
-	P50   float64 `json:"p50_ms"`
-	P95   float64 `json:"p95_ms"`
-	P99   float64 `json:"p99_ms"`
-	P999  float64 `json:"p999_ms"`
+	Mean  float64 `json:"mean_ns"`
+	P50   float64 `json:"p50_ns"`
+	P95   float64 `json:"p95_ns"`
+	P99   float64 `json:"p99_ns"`
+	P999  float64 `json:"p999_ns"`
 }
 
 type MemoryStats struct {
@@ -442,8 +472,10 @@ type ArrowStats struct {
 }
 
 type StreamingStats struct {
-	ConsumerLag int64 `json:"consumer_lag"`
-	BufferDepth int64 `json:"buffer_depth"`
+	ConsumerLag     int64 `json:"consumer_lag"`
+	PeakConsumerLag int64 `json:"peak_consumer_lag"`
+	BufferDepth     int64 `json:"buffer_depth"`
+	PeakBufferDepth int64 `json:"peak_buffer_depth"`
 }
 
 func GenerateTelemetryReport() TelemetryReport {
@@ -472,10 +504,17 @@ func GenerateTelemetryReport() TelemetryReport {
 			GCs:           m.NumGC,
 			GCPauseLastMs: float64(m.PauseNs[(m.NumGC+255)%256]) / 1000000,
 		},
-		Arrow: ArrowStats{},
+		Arrow: ArrowStats{
+			AvgBatchSizeBytes:  getMean("batch_size_bytes"),
+			AvgBatchRows:       getMean("batch_rows"),
+			AvgColumnExpansion: getMean("column_expansion"),
+			AvgDenormFanout:    getMean("denorm_fanout"),
+		},
 		Streaming: StreamingStats{
-			ConsumerLag: int64(consumerLag.Get()),
-			BufferDepth: int64(bufferDepth.Get()),
+			ConsumerLag:     int64(consumerLag.Get()),
+			PeakConsumerLag: int64(consumerLag.GetPeak()),
+			BufferDepth:     int64(bufferDepth.Get()),
+			PeakBufferDepth: int64(bufferDepth.GetPeak()),
 		},
 	}
 
@@ -492,6 +531,11 @@ func getLatencyStats(name string) LatencyPercentiles {
 		P99:   p99 * 1000000000,
 		P999:  p999 * 1000000000,
 	}
+}
+
+func getMean(name string) float64 {
+	_, _, _, mean, _, _, _, _ := globalLatency.Stats(name)
+	return mean
 }
 
 func (r TelemetryReport) ToJSON() ([]byte, error) {
@@ -521,9 +565,14 @@ func (r TelemetryReport) PrintSummary() {
 	fmt.Printf("  GCs:         %d\n", r.Memory.GCs)
 	fmt.Printf("  GC Pause:    %.2f ms\n\n", r.Memory.GCPauseLastMs)
 
+	fmt.Printf("Arrow Integration:\n")
+	fmt.Printf("  Avg Batch:     %.0f rows (%.2f KB)\n", r.Arrow.AvgBatchRows, r.Arrow.AvgBatchSizeBytes/1024)
+	fmt.Printf("  Expansion:     %.2f cols/row\n", r.Arrow.AvgColumnExpansion)
+	fmt.Printf("  Denorm Fanout: %.2f multiplier\n\n", r.Arrow.AvgDenormFanout)
+
 	fmt.Printf("Streaming:\n")
-	fmt.Printf("  Consumer Lag: %d\n", r.Streaming.ConsumerLag)
-	fmt.Printf("  Buffer Depth: %d\n", r.Streaming.BufferDepth)
+	fmt.Printf("  Consumer Lag: %d (Peak: %d)\n", r.Streaming.ConsumerLag, r.Streaming.PeakConsumerLag)
+	fmt.Printf("  Buffer Depth: %d (Peak: %d)\n", r.Streaming.BufferDepth, r.Streaming.PeakBufferDepth)
 }
 
 func StartTelemetryLoop(interval time.Duration, outputFile string) {

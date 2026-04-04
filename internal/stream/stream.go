@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/TFMV/arrowflow/internal/config"
+	"github.com/TFMV/arrowflow/internal/metrics"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -110,10 +111,12 @@ func NewNATSConsumer(cfg *config.Config) (Subscriber, error) {
 }
 
 func (c *natsConsumer) Consume(ctx context.Context, topic string, handler func(msg *Msg) error) error {
-	stream, err := c.js.Stream(ctx, c.conf.Topic)
+	streamName := "ARROWFLOW"
+	stream, err := c.js.Stream(ctx, streamName)
 	if err != nil {
+		// Fallback: try to create it if it doesn't exist
 		stream, err = c.js.CreateStream(ctx, jetstream.StreamConfig{
-			Name:     c.conf.Topic,
+			Name:     streamName,
 			Subjects: []string{c.conf.Topic},
 		})
 		if err != nil {
@@ -129,24 +132,50 @@ func (c *natsConsumer) Consume(ctx context.Context, topic string, handler func(m
 		return err
 	}
 
-	msgs, err := cons.Fetch(10)
+	// Start metrics polling
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+
+		// Initial check
+		if status, err := cons.Info(ctx); err == nil {
+			metrics.SetConsumerLag(int64(status.NumPending))
+			metrics.SetBufferDepth(int64(status.NumAckPending))
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				status, err := cons.Info(ctx)
+				if err == nil {
+					metrics.SetConsumerLag(int64(status.NumPending))
+					metrics.SetBufferDepth(int64(status.NumAckPending))
+				}
+			}
+		}
+	}()
+
+	iter, err := cons.Consume(func(msg jetstream.Msg) {
+		m := &Msg{
+			Payload:   msg.Data(),
+			Timestamp: time.Now().UnixNano(), // Use nanoseconds for consistency
+		}
+		if err := handler(m); err != nil {
+			msg.Term() // Serious error, stop retrying this message
+		} else {
+			msg.Ack()
+		}
+	})
 	if err != nil {
 		return err
 	}
 
-	for msg := range msgs.Messages() {
-		m := &Msg{
-			Payload:   msg.Data(),
-			Timestamp: time.Now().UnixMilli(),
-		}
-		if err := handler(m); err != nil {
-			msg.Nak()
-		} else {
-			msg.Ack()
-		}
-	}
-
-	return msgs.Error()
+	// Wait for context cancellation
+	<-ctx.Done()
+	iter.Stop()
+	return ctx.Err()
 }
 
 func (c *natsConsumer) Close() error {
