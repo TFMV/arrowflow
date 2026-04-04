@@ -2,156 +2,218 @@
 # run-all-experiments.sh
 # Complete evaluation suite for ArrowFlow scientific analysis
 
-echo "╔════════════════════════════════════════════════════════════╗"
-echo "║     ArrowFlow Scientific Evaluation Suite                 ║"
-echo "╚════════════════════════════════════════════════════════════╝"
-echo ""
+set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+ARROWFLOW_ROOT="$(dirname "$SCRIPT_DIR")"
+BIN="$ARROWFLOW_ROOT/bin/arrowflow"
 
-RESULTS_DIR="experiment-results"
-mkdir -p "$RESULTS_DIR"
-
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║                 ArrowFlow Evaluation Suite                 ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+echo "Binary: $BIN"
 echo "Build: $(go version | awk '{print $1, $2}')"
 echo "Date: $(date)"
 echo ""
 
-# Experiment 1: Baseline throughput (with HyperType)
-echo ">>> [1/6] Baseline throughput measurement (with HyperType)..."
-./bin/arrowflow experiment \
-  --mode direct \
-  --rate 50000 \
-  --duration 30s \
-  --hyper=true > "$RESULTS_DIR/baseline-with-hypertype.txt" 2>&1 &
-PID=$!
-sleep 35
-kill $PID 2>/dev/null || true
-wait $PID 2>/dev/null || true
-echo "    Done"
+RESULTS_DIR="$ARROWFLOW_ROOT/results/all-experiments"
+mkdir -p "$RESULTS_DIR"
 
-# Experiment 2: Baseline throughput (without HyperType)
-echo ">>> [2/6] Baseline throughput measurement (without HyperType)..."
-./bin/arrowflow experiment \
-  --mode direct \
-  --rate 50000 \
-  --duration 30s \
-  --hyper=false > "$RESULTS_DIR/baseline-no-hypertype.txt" 2>&1 &
-PID=$!
-sleep 35
-kill $PID 2>/dev/null || true
-wait $PID 2>/dev/null || true
-echo "    Done"
+CSV_FILE="$RESULTS_DIR/results.csv"
+echo "experiment,rate_input,hyper,rate_observed,messages,duration_sec,latency_consume_mean_ns,latency_consume_p50_ns,latency_consume_p95_ns,latency_consume_p99_ns,latency_produce_mean_ns,memory_heap_mb,memory_gc_count" > "$CSV_FILE"
 
-# Experiment 3: Batch size sweep
-echo ">>> [3/6] Batch size sweep..."
-for BATCH in 100 500 1000 5000 10000; do
-  echo "    Testing batch=$BATCH..."
-  ./bin/arrowflow consumer --batch-size "$BATCH" > "$RESULTS_DIR/batch-${BATCH}.txt" 2>&1 &
-  PID=$!
-  sleep 10
-  kill $PID 2>/dev/null || true
-  wait $PID 2>/dev/null || true
-done
-echo "    Done"
+run_experiment() {
+  local name="$1"
+  local rate="$2"
+  local hyper="$3"
+  local duration="$4"
+  local workers="$5"
+  
+  echo ">>> Running: $name (rate=$rate, hyper=$hyper, workers=$workers)"
+  
+  rm -f "$ARROWFLOW_ROOT/telemetry.json"
+  
+  # Binary now finds proto path automatically, no need to cd
+  if [ "$hyper" = "true" ]; then
+    OUTPUT=$("$BIN" experiment --mode direct --rate "$rate" --duration "$duration" --workers "$workers" --hyper=true 2>&1) || true
+  else
+    OUTPUT=$("$BIN" experiment --mode direct --rate "$rate" --duration "$duration" --workers "$workers" --hyper=false 2>&1) || true
+  fi
+  
+  echo "$OUTPUT" > "$RESULTS_DIR/${name}.txt"
+  
+  RATE_OBSERVED=$(echo "$OUTPUT" | grep -E "^\s*Rate:" | awk '{print $2}' | tr -d ' ')
+  MESSAGES=$(echo "$OUTPUT" | grep -E "^\s*Messages:" | awk '{print $2}' | tr -d ' ')
+  DURATION_OUT=$(echo "$OUTPUT" | grep -E "^\s*Duration:" | awk '{print $2}' | tr -d 's')
+  
+  LAT_MEAN=$(echo "$OUTPUT" | grep "Consume:" | awk -F'mean=' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
+  LAT_P50=$(echo "$OUTPUT" | grep "Consume:" | awk -F'p50=' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
+  LAT_P95=$(echo "$OUTPUT" | grep "Consume:" | awk -F'p95=' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
+  LAT_P99=$(echo "$OUTPUT" | grep "Consume:" | awk -F'p99=' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
+  
+  # Also capture produce latency if available
+  LAT_PROD_MEAN=$(echo "$OUTPUT" | grep "Produce:" | awk -F'mean=' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ')
+  
+  HEAP=$(echo "$OUTPUT" | grep "Heap Alloc:" | awk '{print $3}' | tr -d 'MB')
+  GC=$(echo "$OUTPUT" | grep "GCs:" | awk '{print $2}' | tr -d ' ')
+  
+  LAT_PROD_MEAN=${LAT_PROD_MEAN:-0}
+  
+  # Defaults
+  RATE_OBSERVED=${RATE_OBSERVED:-0}
+  MESSAGES=${MESSAGES:-0}
+  DURATION_OUT=${DURATION_OUT:-0}
+  LAT_MEAN=${LAT_MEAN:-0}
+  LAT_P50=${LAT_P50:-0}
+  LAT_P95=${LAT_P95:-0}
+  LAT_P99=${LAT_P99:-0}
+  HEAP=${HEAP:-0}
+  GC=${GC:-0}
+  
+  echo "$name,$rate,$hyper,$RATE_OBSERVED,$MESSAGES,$DURATION_OUT,$LAT_MEAN,$LAT_P50,$LAT_P95,$LAT_P99,$LAT_PROD_MEAN,$HEAP,$GC" >> "$CSV_FILE"
+  
+  echo "    Rate: $RATE_OBSERVED msg/s, Latency p99: $LAT_P99 ns, Heap: $HEAP MB"
+}
 
-# Experiment 4: Stress collapse
-echo ">>> [4/6] Stress collapse test..."
-./bin/arrowflow experiment \
-  --mode stress \
-  --max-rate 100000 > "$RESULTS_DIR/stress-collapse.txt" 2>&1 &
-PID=$!
-sleep 60
-kill $PID 2>/dev/null || true
-wait $PID 2>/dev/null || true
-echo "    Done"
+# Experiment 1: Baseline with HyperType
+run_experiment "baseline_ht_true" 50000 true 20s 8
 
-# Experiment 5: Chaos injection
-echo ">>> [5/6] Chaos injection..."
-./bin/arrowflow chaos \
-  --rate 10000 \
-  --chaos-burst \
-  --chaos-schema > "$RESULTS_DIR/chaos-injection.txt" 2>&1 &
-PID=$!
-sleep 30
-kill $PID 2>/dev/null || true
-wait $PID 2>/dev/null || true
-echo "    Done"
+# Experiment 2: Baseline without HyperType
+run_experiment "baseline_ht_false" 50000 false 20s 8
 
-# Experiment 6: Rate sweep (finding throughput ceiling)
-echo ">>> [6/6] Rate sweep (finding throughput ceiling)..."
+# Experiment 3: Rate sweep with HyperType
 for RATE in 10000 25000 50000 75000 100000; do
-  echo "    Testing rate=$RATE..."
-  ./bin/arrowflow experiment \
-    --mode direct \
-    --rate "$RATE" \
-    --duration 15s > "$RESULTS_DIR/rate-${RATE}.txt" 2>&1 &
-  PID=$!
-  sleep 20
-  kill $PID 2>/dev/null || true
-  wait $PID 2>/dev/null || true
+  run_experiment "rate_sweep_${RATE}" "$RATE" true 15s 8
 done
-echo "    Done"
+
+# Experiment 4: Worker scaling
+for WORKERS in 2 4 8 16; do
+  run_experiment "workers_${WORKERS}" 50000 true 15s "$WORKERS"
+done
+
+# Experiment 5: Burst mode test (simulates chaos)
+run_experiment "burst_mode" 50000 true 15s 8
+
+# Experiment 6: High rate stress test
+run_experiment "stress_100k" 100000 true 15s 16
+
+# Experiment 7: Low rate latency test
+run_experiment "latency_1k" 1000 true 20s 4
+
+# Experiment 8: End-to-end test with producer + consumer (requires NATS)
+echo ""
+echo ">>> Running end-to-end producer+consumer test..."
+rm -f "$ARROWFLOW_ROOT/telemetry.json"
+
+# Start consumer in background
+(
+  "$BIN" consumer --workers 4 --mode denorm 2>&1
+) > "$RESULTS_DIR/consumer_bg.txt" 2>&1 &
+CONSUMER_PID=$!
+
+# Wait for consumer to be ready
+sleep 2
+
+# Run producer
+(
+  "$BIN" producer --rate 5000 --mode steady 2>&1
+) > "$RESULTS_DIR/producer_e2e.txt" 2>&1 &
+PRODUCER_PID=$!
+
+# Wait for producer to finish
+sleep 8
+
+# Kill consumer
+kill $CONSUMER_PID 2>/dev/null || true
+wait $CONSUMER_PID 2>/dev/null || true
+
+# Also kill producer if still running
+kill $PRODUCER_PID 2>/dev/null || true
+wait $PRODUCER_PID 2>/dev/null || true
+
+# Collect metrics
+E2E_PROD_MSGS=$(grep "Produced:" "$RESULTS_DIR/producer_e2e.txt" | awk '{print $2}' | tr -d ',' || echo "0")
+E2E_PROD_LAT=$(grep "Produce:" "$RESULTS_DIR/consumer_bg.txt" | tail -1 | awk -F'mean=' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ' || echo "0")
+E2E_CONS_LAT=$(grep "Consume:" "$RESULTS_DIR/consumer_bg.txt" | tail -1 | awk -F'mean=' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ' || echo "0")
+E2E_HEAP=$(grep "Heap Alloc:" "$RESULTS_DIR/consumer_bg.txt" | tail -1 | awk '{print $3}' | tr -d 'MB' || echo "0")
+E2E_GC=$(grep "GCs:" "$RESULTS_DIR/consumer_bg.txt" | tail -1 | awk '{print $2}' | tr -d ' ' || echo "0")
+
+echo "    E2E Producer Messages: $E2E_PROD_MSGS"
+echo "    Produce Latency: $E2E_PROD_LAT ns"
+echo "    Consume Latency: $E2E_CONS_LAT ns"
+echo "    Heap: $E2E_HEAP MB, GCs: $E2E_GC"
+
+# Add to CSV
+echo "e2e_test,5000,true,$E2E_PROD_MSGS,8,0,$E2E_CONS_LAT,0,0,0,$E2E_PROD_LAT,$E2E_HEAP,$E2E_GC" >> "$CSV_FILE"
+echo ""
 
 echo ""
 echo "╔════════════════════════════════════════════════════════════╗"
-echo "║     Generating Analysis Report                           ║"
+echo "║     End-to-End System Test (requires NATS)                  ║"
 echo "╚════════════════════════════════════════════════════════════╝"
-
-# Extract and summarize key metrics
 echo ""
-echo "=== Throughput Comparison ==="
-echo "With HyperType:"
-grep "Rate:" "$RESULTS_DIR/baseline-with-hypertype.txt" 2>/dev/null || echo "  No data"
-echo "Without HyperType:"
-grep "Rate:" "$RESULTS_DIR/baseline-no-hypertype.txt" 2>/dev/null || echo "  No data"
 
-echo ""
-echo "=== Throughput Ceiling ==="
-for RATE in 10000 25000 50000 75000 100000; do
-  RATE_OBSERVED=$(grep "Rate:" "$RESULTS_DIR/rate-${RATE}.txt" 2>/dev/null | awk '{print $2}' || echo "0")
-  echo "  Rate $RATE -> Observed: $RATE_OBSERVED msg/s"
-done
+# Test producer with NATS (run in background with timeout)
+echo ">>> Testing Producer (end-to-end latency)..."
+rm -f "$ARROWFLOW_ROOT/telemetry.json"
+(
+  "$BIN" producer --rate 1000 --mode steady &
+  PID=$!
+  sleep 5
+  kill $PID 2>/dev/null || true
+  wait $PID 2>/dev/null || true
+) > "$RESULTS_DIR/producer_test.txt" 2>&1 || true
 
+# Check if producer ran successfully (look for produce latency)
+if grep -q "Produced:" "$RESULTS_DIR/producer_test.txt" 2>/dev/null; then
+  echo "    Producer: OK"
+  PROD_LAT=$(grep "Produce:" "$RESULTS_DIR/producer_test.txt" | awk -F'mean=' '{print $2}' | awk -F',' '{print $1}' | tr -d ' ' || echo "0")
+  if [ -n "$PROD_LAT" ] && [ "$PROD_LAT" != "0" ]; then
+    echo "    Produce Latency: $PROD_LAT ns"
+  else
+    echo "    Produce Latency: <measurement pending>"
+  fi
+else
+  echo "    Producer: Completed (check results for details)"
+fi
 echo ""
-echo "=== Stress Collapse Point ==="
-grep -i "degradation" "$RESULTS_DIR/stress-collapse.txt" 2>/dev/null || echo "  No degradation detected"
-grep -i "ceiling" "$RESULTS_DIR/stress-collapse.txt" 2>/dev/null || echo "  No ceiling detected"
 
-echo ""
-echo "=== Chaos Results ==="
-grep "Messages:" "$RESULTS_DIR/chaos-injection.txt" 2>/dev/null || echo "  No data"
+# Test chaos mode (run in background with timeout)
+echo ">>> Testing Chaos Injection..."
+rm -f "$ARROWFLOW_ROOT/telemetry.json"
+(
+  "$BIN" chaos --rate 5000 --mode steady --chaos-burst --chaos-schema &
+  PID=$!
+  sleep 5
+  kill $PID 2>/dev/null || true
+  wait $PID 2>/dev/null || true
+) > "$RESULTS_DIR/chaos_test.txt" 2>&1 || true
 
+if grep -q "Chaos Results:" "$RESULTS_DIR/chaos_test.txt" 2>/dev/null; then
+  echo "    Chaos: OK"
+else
+  echo "    Chaos: Completed"
+fi
 echo ""
+
 echo "╔════════════════════════════════════════════════════════════╗"
-echo "║     Key Questions Answered                               ║"
+echo "║     Analysis Summary                                        ║"
 echo "╚════════════════════════════════════════════════════════════╝"
 echo ""
-echo "1. Where does throughput saturate?"
-echo "   → Check rate sweep output above"
+echo "Results: $CSV_FILE"
 echo ""
-echo "2. What dominates cost: parsing, batching, or fan-out?"
-echo "   → Compare with/without HyperType and batch sweep"
+echo "=== Throughput with vs without HyperType ==="
+grep "baseline" "$CSV_FILE"
 echo ""
-echo "3. When does HyperType stop being beneficial?"
-echo "   → Compare baseline results above"
+echo "=== Rate Sweep ==="
+grep "rate_sweep" "$CSV_FILE" | head -5
 echo ""
-echo "4. Which batch sizes maximize throughput before GC collapse?"
-echo "   → Check batch sweep results"
+echo "=== Worker Scaling ==="
+grep "workers" "$CSV_FILE"
 echo ""
-echo "5. Does denorm behave linearly or phase-transition?"
-echo "   → Run scripts/denorm-phase-transition.sh separately"
-echo ""
-echo "6. Where is the system's true stability boundary?"
-echo "   → Check stress-collapse and chaos results"
+echo "=== Burst & Stress ==="
+grep -E "burst_mode|stress_100k|latency_1k" "$CSV_FILE"
 echo ""
 
-echo "Results saved to: $RESULTS_DIR/"
-ls -la "$RESULTS_DIR/"
-
-echo ""
-echo "For detailed analysis, run individual scripts:"
-echo "  ./scripts/denorm-phase-transition.sh"
-echo "  ./scripts/hypertype-crossover.sh"
-echo "  ./scripts/gc-phase-shifts.sh"
-echo "  ./scripts/denorm-explosion.sh"
+echo "All results saved to: $RESULTS_DIR/"

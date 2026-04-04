@@ -322,16 +322,16 @@ func init() {
 }
 
 func RecordLatency(name string, start time.Time) {
-	duration := time.Since(start).Milliseconds()
-	globalLatency.Observe(name, float64(duration)/1000)
+	duration := time.Since(start).Microseconds()
+	globalLatency.Observe(name, float64(duration)/1000000)
 
 	switch name {
 	case "produce":
-		ProduceLatencyMs.Observe(float64(duration))
+		ProduceLatencyMs.Observe(float64(duration) / 1000)
 	case "consume":
-		ConsumeLatencyMs.Observe(float64(duration))
+		ConsumeLatencyMs.Observe(float64(duration) / 1000)
 	case "batch_output":
-		BatchOutputLatencyMs.Observe(float64(duration))
+		BatchOutputLatencyMs.Observe(float64(duration) / 1000)
 	}
 }
 
@@ -486,11 +486,11 @@ func getLatencyStats(name string) LatencyPercentiles {
 	count, _, _, mean, p50, p95, p99, p999 := globalLatency.Stats(name)
 	return LatencyPercentiles{
 		Count: count,
-		Mean:  mean * 1000,
-		P50:   p50 * 1000,
-		P95:   p95 * 1000,
-		P99:   p99 * 1000,
-		P999:  p999 * 1000,
+		Mean:  mean * 1000000000,
+		P50:   p50 * 1000000000,
+		P95:   p95 * 1000000000,
+		P99:   p99 * 1000000000,
+		P999:  p999 * 1000000000,
 	}
 }
 
@@ -507,12 +507,12 @@ func (r TelemetryReport) PrintSummary() {
 	fmt.Printf("  Bytes/sec:    %.2f MB/s\n", r.Throughput.BytesPerSec/1024/1024)
 	fmt.Printf("  Total:        %d messages, %.2f MB\n\n", r.Throughput.TotalMessages, float64(r.Throughput.TotalBytes)/1024/1024)
 
-	fmt.Printf("Latency (ms):\n")
-	fmt.Printf("  Produce:      mean=%.2f, p50=%.2f, p95=%.2f, p99=%.2f, p99.9=%.2f\n",
+	fmt.Printf("Latency (ns):\n")
+	fmt.Printf("  Produce:      mean=%.0f, p50=%.0f, p95=%.0f, p99=%.0f, p99.9=%.0f\n",
 		r.Latency.Produce.Mean, r.Latency.Produce.P50, r.Latency.Produce.P95, r.Latency.Produce.P99, r.Latency.Produce.P999)
-	fmt.Printf("  Consume:      mean=%.2f, p50=%.2f, p95=%.2f, p99=%.2f, p99.9=%.2f\n",
+	fmt.Printf("  Consume:      mean=%.0f, p50=%.0f, p95=%.0f, p99=%.0f, p99.9=%.0f\n",
 		r.Latency.Consume.Mean, r.Latency.Consume.P50, r.Latency.Consume.P95, r.Latency.Consume.P99, r.Latency.Consume.P999)
-	fmt.Printf("  Batch Output: mean=%.2f, p50=%.2f, p95=%.2f, p99=%.2f, p99.9=%.2f\n\n",
+	fmt.Printf("  Batch Output: mean=%.0f, p50=%.0f, p95=%.0f, p99=%.0f, p99.9=%.0f\n\n",
 		r.Latency.BatchOutput.Mean, r.Latency.BatchOutput.P50, r.Latency.BatchOutput.P95, r.Latency.BatchOutput.P99, r.Latency.BatchOutput.P999)
 
 	fmt.Printf("Memory:\n")

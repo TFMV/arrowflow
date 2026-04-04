@@ -1,8 +1,6 @@
-# ArrowFlow
+# ArrowFlow: Streaming Protobuf → Arrow Pipeline
 
-## A Streaming Protobuf → Arrow Pipeline
-
-A scientific evaluation harness for measuring [bufarrowlib](github.com/loicalleyne/bufarrowlib) under realistic streaming pressure. Designed to find phase transitions, crossover points, and stability boundaries in the ingestion pipeline.
+A scientific evaluation harness for measuring bufarrowlib under realistic streaming pressure. Designed to find phase transitions, crossover points, and stability boundaries in the ingestion pipeline.
 
 ## Quick Start
 
@@ -21,19 +19,19 @@ make build
 │                           ARROWFLOW PIPELINE                                │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  Producer                Broker              Consumer           Arrow       │
-│  ───────                ──────              ────────           ──────       │
+│  Producer                Broker              Consumer           Arrow     │
+│  ───────                ──────              ────────           ──────     │
 │                                                                             │
-│  ┌─────────┐      ┌─────────────┐      ┌─────────────┐    ┌─────────────┐   │
-│  │ Wire    │─────▶│  NATS/      │─────▶│ bufarrowlib │───▶│ RecordBatch │   │
-│  │ Bytes   │      │  Kafka      │      │ Decoder     │    │ Output      │   │
-│  └─────────┘      └─────────────┘      └─────────────┘    └─────────────┘   │
-│       │                                      │                              │
-│       ▼                                      ▼                              │
-│  ┌─────────┐                        ┌─────────────┐                         │
-│  │ Chaos   │                        │ HyperType   │                         │
-│  │ Injector│                        │ (optional)  │                         │
-│  └─────────┘                        └─────────────┘                         │
+│  ┌─────────┐      ┌─────────────┐      ┌─────────────┐    ┌─────────────┐ │
+│  │ Wire    │─────▶│  NATS/      │─────▶│ bufarrowlib │────▶│ RecordBatch │ │
+│  │ Bytes   │      │  Kafka      │      │ Decoder     │    │ Output      │ │
+│  └─────────┘      └─────────────┘      └─────────────┘    └─────────────┘ │
+│       │                                      │                         │
+│       ▼                                      ▼                         │
+│  ┌─────────┐                        ┌─────────────┐                  │
+│  │ Chaos   │                        │ HyperType   │                  │
+│  │ Injector│                        │ (optional)  │                  │
+│  └─────────┘                        └─────────────┘                  │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -59,17 +57,23 @@ make build
 
 ---
 
-# EXPERIMENTS
+# SCIENTIFIC EXPERIMENTS
 
 This section contains reproducible experiments to answer the critical analysis questions.
 
 ## Prerequisites
 
 ```bash
-# Start NATS server (required for streaming with broker)
-docker run -d -p 4222:4222 --name nats nats:latest
+# Start NATS server WITH JetStream enabled (required for streaming)
+docker run -d -p 4222:4222 --name nats nats:latest -js
 
-# Or set NATS_URL if using different instance
+# Or enable JetStream in an existing container
+# docker exec nats nats-server -js
+
+# Verify JetStream is available
+docker exec nats nats-cli -s localhost:4222 jetstream streams ls
+
+# Set environment variables
 export NATS_URL="nats://localhost:4222"
 export TOPIC="arrowflow.test"
 ```
@@ -94,15 +98,16 @@ Run the provided script:
 ./scripts/denorm-phase-transition.sh
 ```
 
-Or run manually:
+Or run manually using background processes:
 
 ```bash
 for RATE in 1000 5000 10000 25000 50000 75000 100000; do
-  timeout 30s ./bin/arrowflow experiment \
-    --mode direct \
-    --rate $RATE \
-    --duration 20s \
-    --workers 8
+  echo "Testing rate: $RATE"
+  ./bin/arrowflow experiment --mode direct --rate $RATE --duration 20s --workers 8 &
+  PID=$!
+  sleep 25
+  kill $PID 2>/dev/null || true
+  wait $PID 2>/dev/null || true
 done
 ```
 
@@ -133,23 +138,18 @@ Or run manually:
 
 ```bash
 # Without HyperType
-timeout 30s ./bin/arrowflow experiment --mode direct --rate 10000 --duration 20s --hyper=false
+./bin/arrowflow experiment --mode direct --rate 10000 --duration 20s --hyper=false &
+PID=$!
+sleep 25
+kill $PID 2>/dev/null || true
+wait $PID 2>/dev/null || true
 
 # With HyperType
-timeout 30s ./bin/arrowflow experiment --mode direct --rate 10000 --duration 20s --hyper=true
-```
-timeout 30s ./bin/arrowflow experiment \
-  --mode direct \
-  --rate 10000 \
-  --duration 20s \
-  --hyper=true 2>&1 | tee /tmp/hypertype.log
-
-# Compare decode latency
-```
-echo ""
-echo "=== Decode Latency Comparison ==="
-grep "consume" /tmp/baseline.log || echo "No consume metrics in baseline"
-grep "consume" /tmp/hypertype.log || echo "No consume metrics in hypertype"
+./bin/arrowflow experiment --mode direct --rate 10000 --duration 20s --hyper=true &
+PID=$!
+sleep 25
+kill $PID 2>/dev/null || true
+wait $PID 2>/dev/null || true
 ```
 
 ### Expected Results
@@ -172,8 +172,13 @@ grep "consume" /tmp/hypertype.log || echo "No consume metrics in hypertype"
 Or run manually:
 
 ```bash
-for BATCH in 100 500 1000 5000 10000 50000; do
-  timeout 20s ./bin/arrowflow consumer --batch-size $BATCH --workers 4
+for BATCH in 100 500 1000 5000 10000; do
+  echo "Testing batch: $BATCH"
+  ./bin/arrowflow consumer --batch-size $BATCH --workers 4 &
+  PID=$!
+  sleep 15
+  kill $PID 2>/dev/null || true
+  wait $PID 2>/dev/null || true
 done
 ```
 
@@ -193,28 +198,20 @@ done
 ### Reproduction
 
 ```bash
-#!/bin/bash
-# denorm-explosion.sh
-
-echo "=== Finding Denorm Explosion Point ==="
-echo "Testing with increasing repeated field cardinality"
-### Reproduction
-
-```bash
 ./scripts/denorm-explosion.sh
 ```
 
 Or run manually:
 
 ```bash
-# Low fan-out
-timeout 20s ./bin/arrowflow experiment --mode direct --rate 20000 --duration 15s
-
-# Medium fan-out  
-timeout 20s ./bin/arrowflow experiment --mode direct --rate 20000 --duration 15s
-
-# High fan-out
-timeout 20s ./bin/arrowflow experiment --mode direct --rate 20000 --duration 15s
+for RATE in 10000 20000 30000; do
+  echo "Testing rate: $RATE"
+  ./bin/arrowflow experiment --mode direct --rate $RATE --duration 15s &
+  PID=$!
+  sleep 20
+  kill $PID 2>/dev/null || true
+  wait $PID 2>/dev/null || true
+done
 ```
 
 ### Warning Signs
@@ -225,8 +222,7 @@ timeout 20s ./bin/arrowflow experiment --mode direct --rate 20000 --duration 15s
 
 ---
 
-## Comprehensive Evaluation Script
-### Run All Experiments
+## Run All Experiments
 
 ```bash
 ./scripts/run-all-experiments.sh
@@ -304,10 +300,25 @@ Results are written to:
 - `telemetry.json` - Real-time metrics in JSON format
 - Console - Live summary printed on exit
 - Prometheus - Available on `:9090/metrics` (if enabled)
+- CSV files - In `results/` directory for each experiment
 
 ---
 
 ## Troubleshooting
+
+### "nats: no response from stream" / High produce latency
+**Cause**: NATS JetStream is not enabled or streams are not configured.
+
+**Solution**:
+```bash
+# Restart NATS with JetStream enabled
+docker rm -f nats
+docker run -d -p 4222:4222 --name nats nats:latest -js
+
+# Create stream manually if needed
+docker exec nats nats-cli -s localhost:4222 \
+  stream add ARROWFLOW --subjects arrowflow.test --storage memory
+```
 
 ### High Latency
 - Reduce batch size

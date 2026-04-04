@@ -17,7 +17,8 @@ spec.md
 coverage.*
 *.coverprofile
 profile.cov
-
+*telemetry*
+experiment-log.md
 # Dependency directories (remove the comment below to include it)
 # vendor/
 

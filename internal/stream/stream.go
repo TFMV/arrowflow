@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"github.com/TFMV/arrowflow/internal/config"
@@ -30,16 +31,56 @@ func NewNATSProducer(cfg *config.Config) (Publisher, error) {
 
 	js, err := jetstream.New(nc)
 	if err != nil {
-		nc.Close()
-		return nil, err
+		log.Printf("Warning: JetStream not available: %v", err)
+		// Try without JetStream - will use direct publish
+		return &natsProducer{conn: nc, js: nil}, nil
+	}
+
+	// Try to create stream if it doesn't exist
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	streamName := "ARROWFLOW"
+	topic := cfg.Topic
+
+	// Check if stream exists
+	if _, err := js.Stream(ctx, streamName); err != nil {
+		// Stream doesn't exist, create it
+		_, err = js.CreateStream(ctx, jetstream.StreamConfig{
+			Name:      streamName,
+			Subjects:  []string{topic},
+			Retention: jetstream.LimitsPolicy,
+			Storage:   jetstream.MemoryStorage,
+			MaxBytes:  1024 * 1024 * 100, // 100MB
+		})
+		if err != nil {
+			log.Printf("Warning: could not create NATS stream: %v", err)
+			// Continue without JetStream - will use direct publish
+			return &natsProducer{conn: nc, js: nil}, nil
+		}
+		log.Printf("Created NATS stream: %s with subject: %s", streamName, topic)
 	}
 
 	return &natsProducer{conn: nc, js: js}, nil
 }
 
 func (p *natsProducer) Publish(ctx context.Context, topic string, msg *Msg) error {
-	_, err := p.js.Publish(ctx, topic, msg.Payload)
-	return err
+	// Try JetStream first, fall back to direct publish
+	if p.js != nil {
+		_, err := p.js.Publish(ctx, topic, msg.Payload)
+		if err == nil {
+			return nil
+		}
+		// If JetStream fails, try direct publish
+		log.Printf("JetStream publish failed: %v, trying direct publish", err)
+	}
+
+	// Fallback: direct nats publish (no JetStream)
+	if p.conn != nil {
+		return p.conn.Publish(topic, msg.Payload)
+	}
+
+	return nil
 }
 
 func (p *natsProducer) Close() error {

@@ -8,7 +8,9 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -144,7 +146,11 @@ func runConsumer(ctx context.Context) error {
 	}
 	defer s.Close()
 
-	fd, err := ba.CompileProtoToFileDescriptor("./internal/schemas/event.proto", []string{"."})
+	protoPath := findProtoPath()
+	protoDir := filepath.Dir(protoPath)
+	protoFile := filepath.Base(protoPath)
+
+	fd, err := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
 	if err != nil {
 		return fmt.Errorf("compile proto: %w", err)
 	}
@@ -251,14 +257,28 @@ func runBenchmark(ctx context.Context) error {
 }
 
 func runExperiment(ctx context.Context) error {
-	mode := flag.String("mode", "direct", "Mode: direct, stress")
-	rate := flag.Int("rate", 10000, "Messages per second")
-	workers := flag.Int("workers", runtime.NumCPU(), "Workers")
-	duration := flag.Duration("duration", 30*time.Second, "Duration")
-	hyper := flag.Bool("hyper", true, "Enable HyperType")
-	flag.Parse()
+	// Create a custom flag set to properly parse experiment-specific flags
+	fs := flag.NewFlagSet("experiment", flag.ExitOnError)
+	mode := fs.String("mode", "direct", "Mode: direct, stress")
+	rate := fs.Int("rate", 10000, "Messages per second")
+	workers := fs.Int("workers", runtime.NumCPU(), "Workers")
+	duration := fs.Duration("duration", 30*time.Second, "Duration")
+	hyper := fs.Bool("hyper", true, "Enable HyperType")
 
-	fd, err := ba.CompileProtoToFileDescriptor("./internal/schemas/event.proto", []string{"."})
+	// Get unparsed args (skip the command name)
+	args := os.Args[2:]
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	fmt.Printf("[DEBUG] mode=%s, rate=%d, workers=%d, duration=%v, hyper=%v\n", *mode, *rate, *workers, *duration, *hyper)
+
+	// Find project root (where internal/schemas exists)
+	protoPath := findProtoPath()
+	protoDir := filepath.Dir(protoPath)
+	protoFile := filepath.Base(protoPath)
+
+	fd, err := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
 	if err != nil {
 		return fmt.Errorf("compile proto: %w", err)
 	}
@@ -267,23 +287,12 @@ func runExperiment(ctx context.Context) error {
 		return fmt.Errorf("get descriptor: %w", err)
 	}
 
-	var ht *ba.HyperType
-	if *hyper {
-		ht = ba.NewHyperType(md)
-	}
-
 	paths := []pbpath.PlanPathSpec{
 		pbpath.PlanPath("schema_version"),
 		pbpath.PlanPath("event_timestamp"),
 		pbpath.PlanPath("user.user_id"),
 		pbpath.PlanPath("session.session_id"),
 	}
-
-	tc, err := ba.New(md, memory.DefaultAllocator, ba.WithHyperType(ht), ba.WithDenormalizerPlan(paths...))
-	if err != nil {
-		return fmt.Errorf("create transcoder: %w", err)
-	}
-	defer tc.Release()
 
 	log.Printf("Experiment: mode=%s, rate=%d, workers=%d, duration=%v", *mode, *rate, *workers, *duration)
 
@@ -299,8 +308,19 @@ func runExperiment(ctx context.Context) error {
 	start := time.Now()
 	deadline := start.Add(*duration)
 
+	var wg sync.WaitGroup
 	for i := 0; i < *workers; i++ {
-		go func() {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			htWorker := ba.NewHyperType(md)
+			tc, err := ba.New(md, memory.DefaultAllocator, ba.WithHyperType(htWorker), ba.WithDenormalizerPlan(paths...))
+			if err != nil {
+				log.Printf("worker %d: create transcoder: %v", workerID, err)
+				return
+			}
+			defer tc.Release()
+
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 			for {
@@ -317,17 +337,17 @@ func runExperiment(ctx context.Context) error {
 						Session:       &pb.Event_SessionContext{SessionId: fmt.Sprintf("sess-%d", rand.Int())},
 					}
 					raw, _ := proto.Marshal(msg)
-					ts := time.Now()
+					start := time.Now()
 					tc.AppendDenormRaw(raw)
-					metrics.RecordLatency("consume", ts)
+					metrics.RecordLatency("consume", start)
 					atomic.AddInt64(&totalMsgs, 1)
 					atomic.AddInt64(&totalBytes, int64(len(raw)))
 				}
 			}
-		}()
+		}(i)
 	}
 
-	time.Sleep(*duration)
+	wg.Wait()
 
 	elapsed := time.Since(start)
 	rateCalc := float64(totalMsgs) / elapsed.Seconds()
@@ -401,6 +421,41 @@ func runChaos(ctx context.Context) error {
 	fmt.Printf("  Bursts: %d\n", bursts)
 	fmt.Printf("  Schema Swaps: %d\n", swaps)
 	return nil
+}
+
+func findProtoPath() string {
+	// Check common locations relative to binary and current dir
+	searchPaths := []string{
+		"./internal/schemas/event.proto",
+		"internal/schemas/event.proto",
+		"../internal/schemas/event.proto",
+		"cmd/arrowflow/internal/schemas/event.proto",
+	}
+
+	// Also check absolute paths from known project locations
+	exePath, err := os.Executable()
+	if err == nil {
+		exeDir := filepath.Dir(exePath)
+		searchPaths = append(searchPaths,
+			filepath.Join(exeDir, "internal/schemas/event.proto"),
+			filepath.Join(exeDir, "..", "internal/schemas/event.proto"),
+			filepath.Join(exeDir, "..", "..", "internal/schemas/event.proto"),
+		)
+	}
+
+	for _, p := range searchPaths {
+		if _, err := os.Stat(p); err == nil {
+			absPath, _ := filepath.Abs(p)
+			log.Printf("Found proto at: %s", absPath)
+			return absPath
+		}
+	}
+
+	// Fallback - try current working dir
+	cwd, _ := os.Getwd()
+	fallback := filepath.Join(cwd, "internal/schemas/event.proto")
+	log.Printf("Using fallback proto path: %s", fallback)
+	return fallback
 }
 
 func init() {
