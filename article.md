@@ -1,8 +1,8 @@
 # I Tried to Break bufarrowlib. It Broke My Mental Model Instead.
 
-A couple days ago, a friend of mine shipped something that solved a problem I'd been complaining about for years. It's called **bufarrowlib** -- a Go library that converts raw Protobuf wire bytes directly into Apache Arrow RecordBatches, no intermediate structs, no codegen, no ceremony.
+A couple days ago, a friend of mine shipped something that solved a problem I'd been complaining about for years. It's called **[bufarrowlib](https://github.com/loicalleyne/bufarrowlib)** -- a Go library that converts raw Protobuf wire bytes directly into Apache Arrow RecordBatches, no intermediate structs, no codegen, no ceremony.
 
-I wanted to actually stress-test it. So I built **ArrowFlow**, an evaluation harness designed to find the breaking points of this pipeline on my Mac M4. What I found wasn't just faster; it exposed where these pipelines fundamentally break.
+I wanted to actually stress-test it. So I built **[ArrowFlow](https://github.com/TFMV/arrowflow)**, an evaluation harness designed to find the breaking points of this pipeline on my Mac M4. What I found wasn't just faster; it exposed where these pipelines fundamentally break.
 
 ---
 
