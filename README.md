@@ -145,6 +145,7 @@ timeout 30s ./bin/arrowflow experiment \
   --hyper=true 2>&1 | tee /tmp/hypertype.log
 
 # Compare decode latency
+```
 echo ""
 echo "=== Decode Latency Comparison ==="
 grep "consume" /tmp/baseline.log || echo "No consume metrics in baseline"
