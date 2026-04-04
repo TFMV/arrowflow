@@ -2,8 +2,6 @@
 # gc-phase-shifts.sh
 # Find batch sizes where GC behavior changes dramatically
 
-set -e
-
 echo "=== Finding GC Phase Transitions ==="
 echo "Sweeping batch sizes to find GC behavior changes"
 echo ""
@@ -11,33 +9,26 @@ echo ""
 RESULTS_DIR="results/gc-phase-shifts"
 mkdir -p $RESULTS_DIR
 
-# Enable GC tracing
-export GODEBUG=gctrace=1
-
-for BATCH in 100 500 1000 5000 10000 50000; do
+for BATCH in 100 500 1000 5000 10000; do
   echo "--- Batch size: $BATCH ---"
   
   LOG_FILE="$RESULTS_DIR/batch-${BATCH}.log"
   
-  # Run with GC tracing
-  timeout 20s ./bin/arrowflow consumer \
+  ./bin/arrowflow consumer \
     --batch-size $BATCH \
     --workers 4 2>&1 | tee "$LOG_FILE" &
   
   PID=$!
   
-  # Wait for some data
-  sleep 10
+  # Wait for data
+  sleep 15
   
   # Get heap stats
   if [ -f telemetry.json ]; then
-    HEAP=$(cat telemetry.json | grep -o '"heap_alloc_mb":[0-9.]*' | tail -1 || echo "N/A")
-    GCS=$(cat telemetry.json | grep -o '"gc_count":[0-9]*' | tail -1 || echo "N/A")
+    HEAP=$(grep -o '"heap_alloc_mb":[0-9.]*' telemetry.json | tail -1 || echo "N/A")
+    GCS=$(grep -o '"gc_count":[0-9]*' telemetry.json | tail -1 || echo "N/A")
     echo "  Heap: $HEAP, GCs: $GCS"
   fi
-  
-  # Let it run a bit more
-  sleep 5
   
   kill $PID 2>/dev/null || true
   wait $PID 2>/dev/null || true
@@ -47,7 +38,7 @@ done
 
 echo "=== GC Phase Analysis ==="
 echo "Look for batch size thresholds where:"
-echo "  - GC frequency jumps (gctrace output)"
+echo "  - GC frequency jumps"
 echo "  - Allocation churn spikes"  
 echo "  - Pause times become non-smooth"
 echo ""
