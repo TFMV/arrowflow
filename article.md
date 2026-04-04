@@ -10,7 +10,7 @@ I wanted to actually stress-test it. So I built **[ArrowFlow](https://github.com
 
 If you've built high-throughput ingestion pipelines, you know the "Protobuf Tax." The routine goes something like this: receive raw bytes from Kafka or NATS, deserialize them into a Go struct, then manually map every field into an Arrow RecordBuilder. Then your schema changes. Then you're back in `protoc` hell, updating generated structs and hand-written mapping logic that nobody wants to touch.
 
-It's slow. It's memory-hungry from all the intermediate allocations. And it's the kind of code that accumulates quiet technical debt until someone has to rewrite it from scratch six months later.
+It's slow. It's memory-hungry from all the intermediate allocations. And it's the kind of code that accumulates technical debt until someone has to rewrite it from scratch six months later.
 
 My friend's core insight with `bufarrowlib` is almost aggressive in its simplicity: **raw bytes in, RecordBatches out.** You hand it a Protobuf descriptor and a declarative plan. It walks the wire bytes directly and writes into Arrow memory, skipping the intermediate Go struct entirely. No `protoc`. No generated code. Just bytes to columnar output.
 
@@ -142,15 +142,19 @@ Lesson: pipelines are only as fast as their slowest stage.
 
 ---
 
-### Batch Size Sweet Spot
+### The Alignment Problem: Finding Your Actual Sweet Spot
 
-* Stable latency: ~5-7 μs
-* Stable GC: ~1100 cycles
+Most benchmarks stop at identifying an internal sweet spot for the library itself. In our tests, `1,000` rows per batch was where `bufarrowlib`’s internal allocation costs fully amortized.
 
-Best result: **~1,000 rows per batch**
+But in a production pipeline, **internal efficiency is not enough.**
 
-Too small -> CPU overhead
-Too large -> GC pressure
+High throughput means nothing if your downstream consumer has to re-chunk your output. We found that the "real" sweet spot isn't a fixed number; it's an alignment:
+
+* **DuckDB/Parquet Alignment**: DuckDB's default row group is **122,880 rows**. Aligning your flush to this boundary allows Arrow RecordBatches to map 1:1 to Parquet row groups, eliminating memory copies and partial row groups.
+* **Network/Kafka Alignment**: Match your flush cadence to `max.partition.fetch.bytes` or gRPC stream chunks so each flush produces exactly one wire message.
+* **CPU vs. Memory**: Under `100` rows, the per-flush fixed cost dominates (CPU bound). Over `10,000` rows, minor marginal gains are outweighed by heap pressure and GC instability (Memory bound).
+
+The rule isn't "batch at 1,000." The rule is: **Match your flush cadence to the granularity of your next stage.**
 
 ---
 
