@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -84,8 +86,10 @@ var DefaultConsumerConfig = ConsumerConfig{
 }
 
 func NewWireConsumer(s stream.Subscriber, cfg *config.Config, cc ConsumerConfig) (*WireConsumer, error) {
-	protoPath := "./internal/schemas/event.proto"
-	fd, err := ba.CompileProtoToFileDescriptor(protoPath, []string{"."})
+	protoPath := findProtoPath()
+	protoDir := filepath.Dir(protoPath)
+	protoFile := filepath.Base(protoPath)
+	fd, err := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
 	if err != nil {
 		return nil, fmt.Errorf("compile proto: %w", err)
 	}
@@ -150,6 +154,40 @@ func parseOutputMode(m string) OutputMode {
 	default:
 		return OutputModeDenorm
 	}
+}
+
+func (wc *WireConsumer) Warmup(corpus [][]byte) error {
+	if len(corpus) == 0 || len(wc.transcoders) == 0 || wc.transcoders[0] == nil {
+		return nil
+	}
+
+	tc := wc.transcoders[0]
+	for _, raw := range corpus {
+		var err error
+		switch wc.outputMode {
+		case OutputModeDenorm:
+			err = tc.AppendDenormRaw(raw)
+		default:
+			err = tc.AppendRaw(raw)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	var rec arrow.RecordBatch
+	switch wc.outputMode {
+	case OutputModeDenorm:
+		rec = tc.NewDenormalizerRecordBatch()
+	default:
+		rec = tc.NewRecordBatch()
+	}
+	rec.Release()
+
+	if wc.ht != nil {
+		return wc.ht.Recompile()
+	}
+	return nil
 }
 
 func (wc *WireConsumer) Run(ctx context.Context) error {
@@ -335,4 +373,22 @@ func recordBatchSize(rec arrow.RecordBatch) int64 {
 		total += col.Data().SizeInBytes()
 	}
 	return int64(total)
+}
+
+func findProtoPath() string {
+	searchPaths := []string{
+		"./internal/schemas/event.proto",
+		"internal/schemas/event.proto",
+		"../internal/schemas/event.proto",
+	}
+
+	for _, path := range searchPaths {
+		if _, err := os.Stat(path); err == nil {
+			absPath, _ := filepath.Abs(path)
+			return absPath
+		}
+	}
+
+	cwd, _ := os.Getwd()
+	return filepath.Join(cwd, "internal/schemas/event.proto")
 }

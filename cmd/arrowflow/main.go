@@ -20,14 +20,12 @@ import (
 	"github.com/TFMV/arrowflow/internal/consumer"
 	"github.com/TFMV/arrowflow/internal/metrics"
 	"github.com/TFMV/arrowflow/internal/producer"
-	"github.com/TFMV/arrowflow/internal/schemas/pb"
 	"github.com/TFMV/arrowflow/internal/stream"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	ba "github.com/loicalleyne/bufarrowlib"
 	"github.com/loicalleyne/bufarrowlib/proto/pbpath"
-	"google.golang.org/protobuf/proto"
 )
 
 type ExperimentResult struct {
@@ -138,6 +136,8 @@ func runConsumer(ctx context.Context, args []string) error {
 	}
 
 	cfg := config.Load()
+	cfg.ConsumerPullWorkers = max(1, *workers)
+	cfg.ConsumerPullBatchSize = min(max(1, *batchSize), 512)
 	s, err := stream.NewConsumer(cfg)
 	if err != nil {
 		return fmt.Errorf("create consumer: %w", err)
@@ -337,28 +337,30 @@ type directPipelineConfig struct {
 }
 
 func runDirectPipeline(parent context.Context, cfg directPipelineConfig) (*ExperimentResult, error) {
-	metrics.Reset()
-
-	base, err := newTranscoder(cfg.EnableHyper, cfg.Denorm)
+	corpus, err := producer.BuildRawCorpus(producer.WireConfig{
+		SizeDist:      cfg.SizeDist,
+		SchemaVersion: "1.0.0",
+	}, corpusSizeForRun(cfg.Messages, cfg.SizeDist), cfg.FixedSize)
 	if err != nil {
 		return nil, err
 	}
-	defer base.Release()
 
-	transcoders := make([]*ba.Transcoder, 0, cfg.Workers)
-	transcoders = append(transcoders, base)
-	for i := 1; i < cfg.Workers; i++ {
-		clone, cloneErr := base.Clone(memory.NewGoAllocator())
-		if cloneErr != nil {
-			return nil, cloneErr
-		}
-		transcoders = append(transcoders, clone)
+	base, ht, err := newTranscoder(cfg.EnableHyper, cfg.Denorm)
+	if err != nil {
+		return nil, err
 	}
-	defer func() {
-		for _, tc := range transcoders[1:] {
-			tc.Release()
-		}
-	}()
+	if err := warmTranscoder(base, ht, cfg.Denorm, corpus); err != nil {
+		base.Release()
+		return nil, err
+	}
+
+	transcoders, err := cloneTranscoders(base, cfg.Workers)
+	if err != nil {
+		base.Release()
+		return nil, err
+	}
+	defer releaseTranscoders(transcoders)
+	shards := shardCorpus(corpus, cfg.Workers)
 
 	runCtx := parent
 	cancel := func() {}
@@ -367,10 +369,11 @@ func runDirectPipeline(parent context.Context, cfg directPipelineConfig) (*Exper
 	}
 	defer cancel()
 
+	metrics.Reset()
+
 	var produced atomic.Int64
 	var producedBytes atomic.Int64
 	var workerErrors atomic.Int64
-	var nextIndex atomic.Int64
 
 	start := time.Now()
 	var wg sync.WaitGroup
@@ -378,15 +381,11 @@ func runDirectPipeline(parent context.Context, cfg directPipelineConfig) (*Exper
 		wg.Add(1)
 		go func(tc *ba.Transcoder, workerIndex int) {
 			defer wg.Done()
-			wp := producer.NewWireProducer(nil, config.Load(), producer.WireConfig{SizeDist: cfg.SizeDist})
+			shard := shardForWorker(shards, workerIndex, corpus)
 			pending := 0
+			cursor := 0
 
-			process := func(evt *pb.Event) bool {
-				raw, marshalErr := proto.Marshal(evt)
-				if marshalErr != nil {
-					workerErrors.Add(1)
-					return false
-				}
+			process := func(raw []byte) bool {
 				startConsume := time.Now()
 				var appendErr error
 				if cfg.Denorm {
@@ -411,36 +410,18 @@ func runDirectPipeline(parent context.Context, cfg directPipelineConfig) (*Exper
 			}
 
 			if cfg.Messages > 0 {
-				for {
-					index := int(nextIndex.Add(1) - 1)
-					if index >= cfg.Messages {
-						break
-					}
-					evt := wp.GenerateWireMessage()
-					if cfg.FixedSize > 0 {
-						evt.Payload = &pb.Event_Payload{EventType: "benchmark", RawData: make([]byte, cfg.FixedSize)}
-					}
-					process(evt)
+				target := rateShare(cfg.Messages, workerIndex, cfg.Workers)
+				for processed := 0; processed < target; processed++ {
+					process(nextRaw(shard, &cursor))
 				}
 			} else {
-				interval := perWorkerInterval(cfg.Rate, cfg.Workers)
-				ticker := time.NewTicker(interval)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-runCtx.Done():
-						if pending > 0 {
-							recordDirectBatch(tc, cfg.Denorm, pending)
-						}
-						return
-					case <-ticker.C:
-						evt := wp.GenerateWireMessage()
-						if cfg.FixedSize > 0 {
-							evt.Payload = &pb.Event_Payload{EventType: "benchmark", RawData: make([]byte, cfg.FixedSize)}
-						}
-						process(evt)
-					}
+				runRateLimitedLoop(runCtx, rateShare(cfg.Rate, workerIndex, cfg.Workers), func() bool {
+					return process(nextRaw(shard, &cursor))
+				})
+				if pending > 0 {
+					recordDirectBatch(tc, cfg.Denorm, pending)
 				}
+				return
 			}
 
 			if pending > 0 {
@@ -481,14 +462,14 @@ type streamExperimentConfig struct {
 }
 
 func runStreamExperiment(parent context.Context, cfg streamExperimentConfig) (*ExperimentResult, error) {
-	metrics.Reset()
-
 	appCfg := config.Load()
 	runID := time.Now().UnixNano()
 	appCfg.StreamName = fmt.Sprintf("ARROWFLOW_EXP_%d", runID)
 	appCfg.Topic = fmt.Sprintf("arrowflow.test.%d", runID)
 	appCfg.ConsumerGroup = fmt.Sprintf("arrowflow-exp-%d", runID)
 	appCfg.ConsumerStartAtNew = false
+	appCfg.ConsumerPullWorkers = max(1, cfg.Workers)
+	appCfg.ConsumerPullBatchSize = min(max(1, cfg.BatchSize), 512)
 
 	pub, err := stream.NewProducer(appCfg)
 	if err != nil {
@@ -514,6 +495,22 @@ func runStreamExperiment(parent context.Context, cfg streamExperimentConfig) (*E
 	}
 	defer wireConsumer.Close()
 
+	var corpus [][]byte
+	if cfg.Injector == nil {
+		corpus, err = producer.BuildRawCorpus(producer.WireConfig{
+			SizeDist:      cfg.SizeDist,
+			SchemaVersion: "1.0.0",
+		}, corpusSizeForRun(0, cfg.SizeDist), 0)
+		if err != nil {
+			return nil, err
+		}
+		if err := wireConsumer.Warmup(corpus); err != nil {
+			return nil, err
+		}
+	}
+
+	metrics.Reset()
+
 	consumeCtx, cancelConsumer := context.WithCancel(parent)
 	defer cancelConsumer()
 
@@ -529,7 +526,8 @@ func runStreamExperiment(parent context.Context, cfg streamExperimentConfig) (*E
 	produceCtx, cancelProduce := context.WithTimeout(parent, cfg.Duration)
 	defer cancelProduce()
 
-	producerWorkers := max(1, min(cfg.Workers, max(cfg.Rate/20000, 1)))
+	producerWorkers := max(1, cfg.Workers)
+	shards := shardCorpus(corpus, producerWorkers)
 	start := time.Now()
 	var produced atomic.Int64
 	var producedBytes atomic.Int64
@@ -553,48 +551,50 @@ func runStreamExperiment(parent context.Context, cfg streamExperimentConfig) (*E
 				wp.AttachInjector(cfg.Injector)
 			}
 
-			ticker := time.NewTicker(10 * time.Millisecond)
-			defer ticker.Stop()
-
-			carry := 0.0
-			baseRate := rateShare(cfg.Rate, worker, producerWorkers)
-			for {
-				select {
-				case <-produceCtx.Done():
-					return
-				case <-ticker.C:
-					targetRate := baseRate
-					if cfg.Injector != nil {
-						targetRate = cfg.Injector.ApplyRate(baseRate)
+			shard := shardForWorker(shards, worker, corpus)
+			cursor := 0
+			publishOne := func() bool {
+				var raw []byte
+				if cfg.Injector != nil {
+					rawMsg, rawErr := wp.GenerateRawMessage(0)
+					if rawErr != nil {
+						return false
 					}
-					carry += float64(targetRate) * tickerIntervalSeconds(ticker)
-					toSend := int(carry)
-					carry -= float64(toSend)
-					for i := 0; i < toSend; i++ {
-						evt := wp.GenerateWireMessage()
-						raw, marshalErr := proto.Marshal(evt)
-						if marshalErr != nil {
-							continue
-						}
-						startPublish := time.Now()
-						if err := pub.Publish(produceCtx, appCfg.Topic, &stream.Msg{Payload: raw}); err != nil {
-							if produceCtx.Err() != nil {
-								return
-							}
-							select {
-							case errCh <- err:
-							default:
-							}
-							cancelProduce()
-							return
-						}
-						metrics.RecordLatency("produce", startPublish)
-						metrics.RecordProducedThroughput(int64(len(raw)), 1)
-						produced.Add(1)
-						producedBytes.Add(int64(len(raw)))
+					raw = rawMsg
+				} else {
+					raw = nextRaw(shard, &cursor)
+				}
+
+				startPublish := time.Now()
+				if err := pub.Publish(produceCtx, appCfg.Topic, &stream.Msg{Payload: raw}); err != nil {
+					if produceCtx.Err() != nil {
+						return false
+					}
+					select {
+					case errCh <- err:
+					default:
+					}
+					cancelProduce()
+					return false
+				}
+				metrics.RecordLatency("produce", startPublish)
+				metrics.RecordProducedThroughput(int64(len(raw)), 1)
+				produced.Add(1)
+				producedBytes.Add(int64(len(raw)))
+				return true
+			}
+
+			baseRate := rateShare(cfg.Rate, worker, producerWorkers)
+			if baseRate <= 0 {
+				for produceCtx.Err() == nil {
+					if !publishOne() && produceCtx.Err() != nil {
+						return
 					}
 				}
+				return
 			}
+
+			runRateLimitedLoop(produceCtx, baseRate, publishOne)
 		}(workerID)
 	}
 
@@ -607,7 +607,7 @@ func runStreamExperiment(parent context.Context, cfg streamExperimentConfig) (*E
 	}
 
 	produceElapsed := time.Since(start)
-	waitForDrain(wireConsumer, produced.Load(), 10*time.Second)
+	waitForDrain(wireConsumer, produced.Load(), maxDuration(10*time.Second, cfg.Duration))
 	cancelConsumer()
 	if consumeErr := <-consumeErrCh; consumeErr != nil {
 		return nil, consumeErr
@@ -678,23 +678,25 @@ func writeTelemetry(report metrics.TelemetryReport) {
 	_ = os.WriteFile("telemetry.json", data, 0o644)
 }
 
-func newTranscoder(enableHyper, denorm bool) (*ba.Transcoder, error) {
+func newTranscoder(enableHyper, denorm bool) (*ba.Transcoder, *ba.HyperType, error) {
 	protoPath := findProtoPath()
 	protoDir := filepath.Dir(protoPath)
 	protoFile := filepath.Base(protoPath)
 
 	fd, err := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
 	if err != nil {
-		return nil, fmt.Errorf("compile proto: %w", err)
+		return nil, nil, fmt.Errorf("compile proto: %w", err)
 	}
 	md, err := ba.GetMessageDescriptorByName(fd, "Event")
 	if err != nil {
-		return nil, fmt.Errorf("get descriptor: %w", err)
+		return nil, nil, fmt.Errorf("get descriptor: %w", err)
 	}
 
+	var ht *ba.HyperType
 	var opts []ba.Option
 	if enableHyper {
-		opts = append(opts, ba.WithHyperType(ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))))
+		ht = ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))
+		opts = append(opts, ba.WithHyperType(ht))
 	}
 	if denorm {
 		opts = append(opts, ba.WithDenormalizerPlan(
@@ -709,7 +711,164 @@ func newTranscoder(enableHyper, denorm bool) (*ba.Transcoder, error) {
 		))
 	}
 
-	return ba.New(md, memory.DefaultAllocator, opts...)
+	tc, err := ba.New(md, memory.DefaultAllocator, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tc, ht, nil
+}
+
+func warmTranscoder(tc *ba.Transcoder, ht *ba.HyperType, denorm bool, corpus [][]byte) error {
+	if tc == nil || len(corpus) == 0 {
+		return nil
+	}
+
+	for _, raw := range corpus {
+		var err error
+		if denorm {
+			err = tc.AppendDenormRaw(raw)
+		} else {
+			err = tc.AppendRaw(raw)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	var rec arrow.RecordBatch
+	if denorm {
+		rec = tc.NewDenormalizerRecordBatch()
+	} else {
+		rec = tc.NewRecordBatch()
+	}
+	rec.Release()
+
+	if ht != nil {
+		return ht.Recompile()
+	}
+	return nil
+}
+
+func cloneTranscoders(base *ba.Transcoder, workers int) ([]*ba.Transcoder, error) {
+	if workers <= 0 {
+		workers = 1
+	}
+
+	transcoders := make([]*ba.Transcoder, 0, workers)
+	transcoders = append(transcoders, base)
+	for i := 1; i < workers; i++ {
+		clone, err := base.Clone(memory.NewGoAllocator())
+		if err != nil {
+			for _, tc := range transcoders[1:] {
+				tc.Release()
+			}
+			return nil, err
+		}
+		transcoders = append(transcoders, clone)
+	}
+	return transcoders, nil
+}
+
+func releaseTranscoders(transcoders []*ba.Transcoder) {
+	for _, tc := range transcoders {
+		if tc != nil {
+			tc.Release()
+		}
+	}
+}
+
+func corpusSizeForRun(messages int, sizeDist string) int {
+	size := 8192
+	switch sizeDist {
+	case "large", "heavy-tail":
+		size = 4096
+	}
+	if messages > 0 && messages < size {
+		return messages
+	}
+	return size
+}
+
+func shardCorpus(corpus [][]byte, workers int) [][][]byte {
+	if workers <= 0 {
+		workers = 1
+	}
+	shards := make([][][]byte, workers)
+	if len(corpus) == 0 {
+		return shards
+	}
+	for i, raw := range corpus {
+		shards[i%workers] = append(shards[i%workers], raw)
+	}
+	return shards
+}
+
+func shardForWorker(shards [][][]byte, worker int, fallback [][]byte) [][]byte {
+	if worker >= 0 && worker < len(shards) && len(shards[worker]) > 0 {
+		return shards[worker]
+	}
+	return fallback
+}
+
+func nextRaw(shard [][]byte, cursor *int) []byte {
+	if len(shard) == 0 {
+		return nil
+	}
+	raw := shard[*cursor%len(shard)]
+	*cursor = *cursor + 1
+	return raw
+}
+
+func runRateLimitedLoop(ctx context.Context, rate int, fn func() bool) {
+	if rate <= 0 {
+		for ctx.Err() == nil {
+			if !fn() && ctx.Err() != nil {
+				return
+			}
+		}
+		return
+	}
+
+	last := time.Now()
+	budget := 0.0
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		now := time.Now()
+		budget += float64(rate) * now.Sub(last).Seconds()
+		last = now
+
+		if budget < 1 {
+			sleepFor := time.Duration(((1 - budget) / float64(rate)) * float64(time.Second))
+			if sleepFor <= 0 {
+				sleepFor = 50 * time.Microsecond
+			}
+			if sleepFor > time.Millisecond {
+				sleepFor = time.Millisecond
+			}
+			timer := time.NewTimer(sleepFor)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+
+		toRun := int(budget)
+		budget -= float64(toRun)
+		for i := 0; i < toRun; i++ {
+			if ctx.Err() != nil {
+				return
+			}
+			if !fn() && ctx.Err() != nil {
+				return
+			}
+		}
+	}
 }
 
 func recordDirectBatch(tc *ba.Transcoder, denorm bool, inputMessages int) {
@@ -737,21 +896,6 @@ func recordBatchSize(rec arrow.RecordBatch) int64 {
 	return int64(total)
 }
 
-func perWorkerInterval(rate, workers int) time.Duration {
-	if rate <= 0 {
-		return time.Microsecond
-	}
-	perWorker := rate / max(workers, 1)
-	if perWorker <= 0 {
-		perWorker = 1
-	}
-	interval := time.Second / time.Duration(perWorker)
-	if interval <= 0 {
-		return time.Microsecond
-	}
-	return interval
-}
-
 func rateShare(total, worker, workers int) int {
 	if workers <= 1 {
 		return total
@@ -761,10 +905,6 @@ func rateShare(total, worker, workers int) int {
 		share++
 	}
 	return share
-}
-
-func tickerIntervalSeconds(ticker *time.Ticker) float64 {
-	return 0.01
 }
 
 func outputMode(denorm bool) string {
@@ -784,6 +924,13 @@ func waitForDrain(cons *consumer.WireConsumer, produced int64, timeout time.Dura
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func findProtoPath() string {

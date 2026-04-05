@@ -100,9 +100,12 @@ That means the fanout is not hypothetical. The transcoder is really flattening r
 
 ## The Concurrency Rule You Really Cannot Ignore
 
-One thing my friend was very clear about, and the harness confirmed quickly: transcoders are worker-local resources.
+One detail my friend pushed me on, correctly, is worth being precise about:
 
-Do not share them across goroutines.
+- `HyperType` is safe to share
+- `Transcoder` is not
+
+That means the right pattern is not “one HyperType per worker.” It is “one shared HyperType, cloned transcoders per worker.”
 
 The ArrowFlow worker model is deliberately boring:
 
@@ -117,11 +120,14 @@ for i := 1; i < workers; i++ {
 }
 ```
 
+Under the hood, those clones keep sharing the same `*HyperType`, which is exactly what you want. You pay the compile cost once, then keep worker-local append state.
+
 That looks like a small detail, but it is the difference between a serious pipeline and a benchmark that lies to you.
 
 Each worker gets:
 
 - its own transcoder clone
+- access to the same HyperType
 - its own append path
 - its own batch flush cadence
 
@@ -194,30 +200,63 @@ All three nodes were on one machine, so this is still single-host cluster behavi
 
 ## What The Numbers Actually Say
 
-After fixing several harness issues that were masking configuration differences, I reran the full STREAM suite and landed on a result set that feels honest.
+After fixing several harness issues that were masking configuration differences, I reran the full STREAM suite and added a direct corpus benchmark path that warms HyperType before timing starts.
 
 The data lives in `results/all-experiments/results.csv`, but the most interesting parts are easy to summarize.
+
+### The direct path is the first thing I wanted to sanity-check
+
+Before talking about the broker, I wanted to know whether I was using `bufarrowlib` correctly.
+
+One direct benchmark run with:
+
+- `100000` messages
+- fixed `1024`-byte payloads
+- `8` workers
+- `batch=1000`
+- HyperType enabled
+- denorm enabled
+
+landed at:
+
+- `91417.93 msg/s`
+- `237.73 MB/s`
+
+And a heavier direct run with heavy-tail payloads sustained:
+
+- `49999.20 msg/s` for `10s`
+- `444.37 MB/s`
+- `35.8 us` mean consume latency
+- `6.4 us` mean batch-output latency
+
+That was the first reassuring number in the whole project.
+
+It told me the low STREAM numbers were not “`bufarrowlib` is slow.”
+
+They were “the bottleneck moved.”
 
 ### HyperType is not a rounding error
 
 On the replicated STREAM path, mean consume latency dropped by:
 
-- `2.95x` on small messages: `26.9 us` -> `9.1 us`
-- `1.95x` on medium messages: `37.2 us` -> `19.0 us`
-- `1.52x` on large messages: `119.5 us` -> `78.7 us`
-- `2.02x` on heavy-tail messages: `75.8 us` -> `37.5 us`
+- `2.71x` on small messages: `24.2 us` -> `8.9 us`
+- `2.49x` on medium messages: `36.0 us` -> `14.5 us`
+- `1.39x` on large messages: `158.0 us` -> `113.3 us`
+- `1.90x` on heavy-tail messages: `73.5 us` -> `38.8 us`
 
 That is strong enough that I would enable it by default unless I had a very specific reason not to.
 
-### The best batch size was still about `1000`
+One interesting wrinkle: in STREAM mode, lower consume latency did not always translate into higher throughput. Once the broker was the long pole, some HyperType runs were faster inside the process without moving the end-to-end message rate much.
+
+### The best batch size was actually `500`
 
 At `50000 msg/s` offered load with heavy-tail payloads:
 
-- `batch=100` reached `2253.99 msg/s`, `41.5 us` mean consume latency, `38.45 MB` heap
-- `batch=500` reached `2142.19 msg/s`, `40.2 us`, `241.77 MB` heap
-- `batch=1000` reached `2402.62 msg/s`, `36.5 us`, `223.98 MB` heap
-- `batch=5000` reached `2068.75 msg/s`, `48.7 us`, `1343.04 MB` heap
-- `batch=10000` reached `2199.06 msg/s`, `53.5 us`, `1477.80 MB` heap
+- `batch=100` reached `4753.43 msg/s`, `38.3 us` mean consume latency, `37.76 MB` heap
+- `batch=500` reached `4838.98 msg/s`, `35.8 us`, `242.63 MB` heap
+- `batch=1000` reached `4318.51 msg/s`, `39.9 us`, `426.72 MB` heap
+- `batch=5000` reached `3131.43 msg/s`, `53.4 us`, `1944.95 MB` heap
+- `batch=10000` reached `3837.94 msg/s`, `65.1 us`, `2149.75 MB` heap
 
 This is exactly the trade you would expect in a real pipeline: after a point, “bigger batch” mostly means “more queued memory.”
 
@@ -227,14 +266,14 @@ For this schema, denormalized output beat nested output.
 
 At `50000 msg/s` offered load:
 
-- nested mode: `1998.80 msg/s`, `52.8 us` mean consume latency
-- denorm mode: `2932.68 msg/s`, `32.3 us` mean consume latency
+- nested mode: `4492.68 msg/s`, `46.1 us` mean consume latency
+- denorm mode: `4639.97 msg/s`, `36.2 us` mean consume latency
 
 And this was not fake fanout. The heavy-tail denorm path averaged:
 
-- `72.37x` denorm fanout
+- `71.79x` denorm fanout
 - `8` Arrow columns in the selected plan
-- `66,323` average rows per emitted batch in the denorm run
+- `69,397` average rows per emitted batch in the denorm run
 
 This goes against the usual instinct that fanout is always the expensive path. Here, the structured, columnar write path is cheaper than walking nested structures repeatedly.
 
@@ -244,9 +283,11 @@ That result is specific to this event shape and this denorm plan, but it is stil
 
 The saturation sweep peaked at:
 
-- `5404.24 msg/s` observed throughput at `200000 msg/s` offered load
-- `32.5 us` mean consume latency
-- `1.45 ms` mean produce latency
+- `4680.39 msg/s` observed throughput at `150000 msg/s` offered load
+- `39.7 us` mean consume latency
+- `1.71 ms` mean produce latency
+
+And `200000 msg/s` did not move it meaningfully beyond that. It came in at `4661.59 msg/s`.
 
 That last number is the tell.
 
@@ -284,12 +325,12 @@ At high saturation and in chaos mode, the system did not primarily collapse into
 
 The chaos run looked like this:
 
-- `28892` consumed messages in `20s`
-- `655.4 us` mean produce latency
-- `38.7 us` mean consume latency
-- `365.48 MB` heap allocation
-- `7817` peak buffer depth
-- `0` sustained consumer lag
+- `87418` consumed messages in `20s`
+- `1.79 ms` mean produce latency
+- `34.6 us` mean consume latency
+- `287.25 MB` heap allocation
+- `7875` peak buffer depth
+- `108` peak consumer lag
 
 That tells me the first pressure surface in this environment is consumer-side buffering and batch formation, not the broker falling irrecoverably behind.
 
@@ -299,12 +340,12 @@ I also swept worker counts, because everybody always asks whether more goroutine
 
 At `50000 msg/s` offered load:
 
-- `2 workers`: `2120.17 msg/s`, `36.2 us` mean consume latency
-- `4 workers`: `2057.39 msg/s`, `39.6 us`
-- `8 workers`: `1759.39 msg/s`, `52.7 us`
-- `16 workers`: `2133.66 msg/s`, `51.5 us`
+- `2 workers`: `2540.71 msg/s`, `31.9 us` mean consume latency
+- `4 workers`: `3249.53 msg/s`, `38.2 us`
+- `8 workers`: `4247.79 msg/s`, `38.6 us`
+- `16 workers`: `4692.71 msg/s`, `47.0 us`
 
-So no, this was not a case where “just add workers” solved it. Coordination and memory behavior were already in charge.
+So no, this was still not a case where “just add workers” solved everything. But once I fixed the single-callback fetch path, workers finally started to matter in the place they should have mattered: broker pull concurrency.
 
 ## Why I Think `bufarrowlib` Matters
 
