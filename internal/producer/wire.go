@@ -331,6 +331,35 @@ func (wp *WireProducer) GenerateWireMessage() *pb.Event {
 	return evt
 }
 
+func (wp *WireProducer) GenerateRawMessage(fixedSize int) ([]byte, error) {
+	evt := wp.GenerateWireMessage()
+	if fixedSize > 0 {
+		evt.Payload = &pb.Event_Payload{
+			EventType: "benchmark",
+			RawData:   make([]byte, fixedSize),
+			Metadata:  map[string]string{"format": "raw"},
+		}
+	}
+	return proto.Marshal(evt)
+}
+
+func BuildRawCorpus(wc WireConfig, count, fixedSize int) ([][]byte, error) {
+	if count <= 0 {
+		return nil, nil
+	}
+
+	wp := NewWireProducer(nil, nil, wc)
+	corpus := make([][]byte, 0, count)
+	for i := 0; i < count; i++ {
+		raw, err := wp.GenerateRawMessage(fixedSize)
+		if err != nil {
+			return nil, err
+		}
+		corpus = append(corpus, raw)
+	}
+	return corpus, nil
+}
+
 var stressConfig = StressConfig{
 	IncludeUser:       0.7,
 	IncludeSession:    0.6,

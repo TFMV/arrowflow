@@ -1,40 +1,40 @@
-2026/04/04 22:38:56 Worker 5: processed 6 batches
-2026/04/04 22:38:56 Worker 0: processed 6 batches
-2026/04/04 22:38:56 Worker 7: processed 6 batches
-2026/04/04 22:38:56 Worker 6: processed 6 batches
-2026/04/04 22:38:56 Worker 1: processed 6 batches
-2026/04/04 22:38:56 Worker 3: processed 6 batches
-2026/04/04 22:38:56 Worker 4: processed 6 batches
-2026/04/04 22:38:56 Worker 2: processed 6 batches
+2026/04/05 00:09:44 Worker 4: processed 21 batches
+2026/04/05 00:09:44 Worker 0: processed 21 batches
+2026/04/05 00:09:44 Worker 6: processed 21 batches
+2026/04/05 00:09:44 Worker 7: processed 21 batches
+2026/04/05 00:09:44 Worker 3: processed 21 batches
+2026/04/05 00:09:44 Worker 5: processed 21 batches
+2026/04/05 00:09:44 Worker 1: processed 21 batches
+2026/04/05 00:09:44 Worker 2: processed 21 batches
 Experiment Results:
   Mode: stream
-  Duration: 15.000058542s
-  Messages: 41222
-  Rate: 2748.12 msg/s
+  Duration: 14.999996959s
+  Messages: 160770
+  Rate: 10718.00 msg/s
 === ArrowFlow Telemetry Report ===
-Timestamp: 2026-04-04T22:38:56-05:00
+Timestamp: 2026-04-05T00:09:44-05:00
 
 Throughput:
-  Messages/sec: 1639.39
-  Bytes/sec:    2.90 MB/s
-  Total:        41222 messages, 73.04 MB
+  Messages/sec: 5345.80
+  Bytes/sec:    9.46 MB/s
+  Total:        160770 messages, 284.45 MB
 
 Latency (ns):
-  Produce:      mean=350634, p50=277375, p95=472584, p99=1442917, p99.9=6660625
-  Consume:      mean=9106, p50=4583, p95=25875, p99=36542, p99.9=61541
-  Batch Output: mean=20227, p50=4792, p95=114833, p99=144083, p99.9=144083
+  Produce:      mean=745229, p50=554709, p95=1349542, p99=4131084, p99.9=15627958
+  Consume:      mean=8926, p50=4916, p95=28791, p99=43042, p99.9=66709
+  Batch Output: mean=8058, p50=7125, p95=14083, p99=27834, p99.9=27834
 
 Memory:
-  Heap Alloc:  74.96 MB
-  Heap In Use: 92.81 MB
-  GCs:         30
-  GC Pause:    0.07 ms
+  Heap Alloc:  121.83 MB
+  Heap In Use: 141.85 MB
+  GCs:         48
+  GC Pause:    0.11 ms
 
 Arrow Integration:
-  Avg Batch:     1718 rows (215.45 KB)
+  Avg Batch:     1914 rows (239.99 KB)
   Expansion:     8.00 columns
   Denorm Fanout: 2.00 multiplier
 
 Streaming:
-  Consumer Lag: 0 (Peak: 148)
-  Buffer Depth: 1222 (Peak: 7900)
+  Consumer Lag: 0 (Peak: 709)
+  Buffer Depth: 770 (Peak: 7559)

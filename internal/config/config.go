@@ -16,6 +16,9 @@ type Config struct {
 	ConsumerStartAtNew    bool
 	ConsumerAckWait       time.Duration
 	ConsumerMaxAckPending int
+	ConsumerPullWorkers   int
+	ConsumerPullBatchSize int
+	ConsumerFetchMaxWait  time.Duration
 	BatchSize             int
 	BufferSizeBytes       int
 	StreamReplicas        int
@@ -34,6 +37,9 @@ func Load() *Config {
 		ConsumerStartAtNew:    getEnvBool("CONSUMER_START_AT_NEW", false),
 		ConsumerAckWait:       getEnvDuration("CONSUMER_ACK_WAIT", 30*time.Second),
 		ConsumerMaxAckPending: getEnvInt("CONSUMER_MAX_ACK_PENDING", 4096),
+		ConsumerPullWorkers:   getEnvInt("CONSUMER_PULL_WORKERS", 4),
+		ConsumerPullBatchSize: getEnvInt("CONSUMER_PULL_BATCH_SIZE", 256),
+		ConsumerFetchMaxWait:  getEnvDuration("CONSUMER_FETCH_MAX_WAIT", 250*time.Millisecond),
 		BatchSize:             getEnvInt("BATCH_SIZE", 1000),
 		BufferSizeBytes:       getEnvInt("BUFFER_SIZE_BYTES", 1024*1024),
 		StreamReplicas:        getEnvInt("STREAM_REPLICAS", 3),

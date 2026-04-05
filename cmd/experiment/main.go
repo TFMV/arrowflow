@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/TFMV/arrowflow/internal/config"
 	"github.com/TFMV/arrowflow/internal/metrics"
 	"github.com/TFMV/arrowflow/internal/producer"
 
@@ -22,7 +21,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	ba "github.com/loicalleyne/bufarrowlib"
 	"github.com/loicalleyne/bufarrowlib/proto/pbpath"
-	"google.golang.org/protobuf/proto"
 )
 
 func main() {
@@ -79,30 +77,35 @@ type result struct {
 }
 
 func runDirect(parent context.Context, cfg directConfig) (*result, error) {
-	metrics.Reset()
-
-	base, err := newTranscoder(cfg.EnableHyper, cfg.Denorm)
+	corpus, err := producer.BuildRawCorpus(producer.WireConfig{
+		SizeDist:      cfg.SizeDist,
+		SchemaVersion: "1.0.0",
+	}, corpusSize(cfg.SizeDist), 0)
 	if err != nil {
 		return nil, err
 	}
-	defer base.Release()
 
-	transcoders := []*ba.Transcoder{base}
-	for i := 1; i < cfg.Workers; i++ {
-		clone, cloneErr := base.Clone(memory.NewGoAllocator())
-		if cloneErr != nil {
-			return nil, cloneErr
-		}
-		transcoders = append(transcoders, clone)
+	base, ht, err := newTranscoder(cfg.EnableHyper, cfg.Denorm)
+	if err != nil {
+		return nil, err
 	}
-	defer func() {
-		for _, tc := range transcoders[1:] {
-			tc.Release()
-		}
-	}()
+	if err := warmTranscoder(base, ht, cfg.Denorm, corpus); err != nil {
+		base.Release()
+		return nil, err
+	}
+
+	transcoders, err := cloneTranscoders(base, cfg.Workers)
+	if err != nil {
+		base.Release()
+		return nil, err
+	}
+	defer releaseTranscoders(transcoders)
+	shards := shardCorpus(corpus, cfg.Workers)
 
 	ctx, cancel := context.WithTimeout(parent, cfg.Duration)
 	defer cancel()
+
+	metrics.Reset()
 
 	var totalMessages atomic.Int64
 	var totalBytes atomic.Int64
@@ -110,53 +113,47 @@ func runDirect(parent context.Context, cfg directConfig) (*result, error) {
 
 	start := time.Now()
 	var wg sync.WaitGroup
-	for _, tc := range transcoders {
+	for workerID, tc := range transcoders {
 		wg.Add(1)
-		go func(tc *ba.Transcoder) {
+		go func(worker int, tc *ba.Transcoder) {
 			defer wg.Done()
-			wp := producer.NewWireProducer(nil, config.Load(), producer.WireConfig{SizeDist: cfg.SizeDist})
-			ticker := time.NewTicker(perWorkerInterval(cfg.Rate, cfg.Workers))
-			defer ticker.Stop()
-
+			shard := shardForWorker(shards, worker, corpus)
+			cursor := 0
 			pending := 0
-			for {
-				select {
-				case <-ctx.Done():
-					if pending > 0 {
-						recordBatch(tc, cfg.Denorm, pending)
-					}
-					return
-				case <-ticker.C:
-					raw, marshalErr := proto.Marshal(wp.GenerateWireMessage())
-					if marshalErr != nil {
-						errorsCount.Add(1)
-						continue
-					}
 
-					startConsume := time.Now()
-					var appendErr error
-					if cfg.Denorm {
-						appendErr = tc.AppendDenormRaw(raw)
-					} else {
-						appendErr = tc.AppendRaw(raw)
-					}
-					if appendErr != nil {
-						errorsCount.Add(1)
-						continue
-					}
-
-					metrics.RecordLatency("consume", startConsume)
-					metrics.RecordConsumedThroughput(int64(len(raw)), 1)
-					totalMessages.Add(1)
-					totalBytes.Add(int64(len(raw)))
-					pending++
-					if pending >= cfg.BatchSize {
-						recordBatch(tc, cfg.Denorm, pending)
-						pending = 0
-					}
+			process := func(raw []byte) bool {
+				startConsume := time.Now()
+				var appendErr error
+				if cfg.Denorm {
+					appendErr = tc.AppendDenormRaw(raw)
+				} else {
+					appendErr = tc.AppendRaw(raw)
 				}
+				if appendErr != nil {
+					errorsCount.Add(1)
+					return false
+				}
+
+				metrics.RecordLatency("consume", startConsume)
+				metrics.RecordConsumedThroughput(int64(len(raw)), 1)
+				totalMessages.Add(1)
+				totalBytes.Add(int64(len(raw)))
+				pending++
+				if pending >= cfg.BatchSize {
+					recordBatch(tc, cfg.Denorm, pending)
+					pending = 0
+				}
+				return true
 			}
-		}(tc)
+
+			runRateLimitedLoop(ctx, rateShare(cfg.Rate, worker, cfg.Workers), func() bool {
+				return process(nextRaw(shard, &cursor))
+			})
+
+			if pending > 0 {
+				recordBatch(tc, cfg.Denorm, pending)
+			}
+		}(workerID, tc)
 	}
 
 	wg.Wait()
@@ -202,23 +199,25 @@ func printResult(result *result) {
 	log.Printf("Errors: %d", result.errors)
 }
 
-func newTranscoder(enableHyper, denorm bool) (*ba.Transcoder, error) {
+func newTranscoder(enableHyper, denorm bool) (*ba.Transcoder, *ba.HyperType, error) {
 	protoPath := findProtoPath()
 	protoDir := filepath.Dir(protoPath)
 	protoFile := filepath.Base(protoPath)
 
 	fd, err := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	md, err := ba.GetMessageDescriptorByName(fd, "Event")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
+	var ht *ba.HyperType
 	var opts []ba.Option
 	if enableHyper {
-		opts = append(opts, ba.WithHyperType(ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))))
+		ht = ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))
+		opts = append(opts, ba.WithHyperType(ht))
 	}
 	if denorm {
 		opts = append(opts, ba.WithDenormalizerPlan(
@@ -232,7 +231,11 @@ func newTranscoder(enableHyper, denorm bool) (*ba.Transcoder, error) {
 			pbpath.PlanPath("tags[*].key"),
 		))
 	}
-	return ba.New(md, memory.DefaultAllocator, opts...)
+	tc, err := ba.New(md, memory.DefaultAllocator, opts...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tc, ht, nil
 }
 
 func recordBatch(tc *ba.Transcoder, denorm bool, inputMessages int) {
@@ -256,19 +259,159 @@ func recordBatch(tc *ba.Transcoder, denorm bool, inputMessages int) {
 	metrics.RecordBatchMetrics(int(rec.NumRows()), int(rec.NumCols()), int64(sizeBytes), inputMessages)
 }
 
-func perWorkerInterval(rate, workers int) time.Duration {
+func warmTranscoder(tc *ba.Transcoder, ht *ba.HyperType, denorm bool, corpus [][]byte) error {
+	if tc == nil || len(corpus) == 0 {
+		return nil
+	}
+
+	for _, raw := range corpus {
+		var err error
+		if denorm {
+			err = tc.AppendDenormRaw(raw)
+		} else {
+			err = tc.AppendRaw(raw)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	var rec arrow.RecordBatch
+	if denorm {
+		rec = tc.NewDenormalizerRecordBatch()
+	} else {
+		rec = tc.NewRecordBatch()
+	}
+	rec.Release()
+
+	if ht != nil {
+		return ht.Recompile()
+	}
+	return nil
+}
+
+func cloneTranscoders(base *ba.Transcoder, workers int) ([]*ba.Transcoder, error) {
+	if workers <= 0 {
+		workers = 1
+	}
+
+	transcoders := make([]*ba.Transcoder, 0, workers)
+	transcoders = append(transcoders, base)
+	for i := 1; i < workers; i++ {
+		clone, err := base.Clone(memory.NewGoAllocator())
+		if err != nil {
+			for _, tc := range transcoders[1:] {
+				tc.Release()
+			}
+			return nil, err
+		}
+		transcoders = append(transcoders, clone)
+	}
+	return transcoders, nil
+}
+
+func releaseTranscoders(transcoders []*ba.Transcoder) {
+	for _, tc := range transcoders {
+		if tc != nil {
+			tc.Release()
+		}
+	}
+}
+
+func corpusSize(sizeDist string) int {
+	switch sizeDist {
+	case "large", "heavy-tail":
+		return 4096
+	default:
+		return 8192
+	}
+}
+
+func shardCorpus(corpus [][]byte, workers int) [][][]byte {
+	if workers <= 0 {
+		workers = 1
+	}
+	shards := make([][][]byte, workers)
+	for i, raw := range corpus {
+		shards[i%workers] = append(shards[i%workers], raw)
+	}
+	return shards
+}
+
+func shardForWorker(shards [][][]byte, worker int, fallback [][]byte) [][]byte {
+	if worker >= 0 && worker < len(shards) && len(shards[worker]) > 0 {
+		return shards[worker]
+	}
+	return fallback
+}
+
+func nextRaw(shard [][]byte, cursor *int) []byte {
+	raw := shard[*cursor%len(shard)]
+	*cursor = *cursor + 1
+	return raw
+}
+
+func runRateLimitedLoop(ctx context.Context, rate int, fn func() bool) {
 	if rate <= 0 {
-		return time.Microsecond
+		for ctx.Err() == nil {
+			if !fn() && ctx.Err() != nil {
+				return
+			}
+		}
+		return
 	}
-	perWorker := rate / max(workers, 1)
-	if perWorker <= 0 {
-		perWorker = 1
+
+	last := time.Now()
+	budget := 0.0
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		now := time.Now()
+		budget += float64(rate) * now.Sub(last).Seconds()
+		last = now
+
+		if budget < 1 {
+			sleepFor := time.Duration(((1 - budget) / float64(rate)) * float64(time.Second))
+			if sleepFor <= 0 {
+				sleepFor = 50 * time.Microsecond
+			}
+			if sleepFor > time.Millisecond {
+				sleepFor = time.Millisecond
+			}
+			timer := time.NewTimer(sleepFor)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+
+		toRun := int(budget)
+		budget -= float64(toRun)
+		for i := 0; i < toRun; i++ {
+			if ctx.Err() != nil {
+				return
+			}
+			if !fn() && ctx.Err() != nil {
+				return
+			}
+		}
 	}
-	interval := time.Second / time.Duration(perWorker)
-	if interval <= 0 {
-		return time.Microsecond
+}
+
+func rateShare(total, worker, workers int) int {
+	if workers <= 1 {
+		return total
 	}
-	return interval
+	share := total / workers
+	if worker < total%workers {
+		share++
+	}
+	return share
 }
 
 func findProtoPath() string {

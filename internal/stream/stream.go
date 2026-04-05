@@ -2,7 +2,9 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/TFMV/arrowflow/internal/config"
@@ -112,11 +114,14 @@ func (c *natsConsumer) Consume(ctx context.Context, topic string, handler func(m
 	}
 
 	consumerCfg := jetstream.ConsumerConfig{
-		Durable:       c.conf.ConsumerGroup,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       c.conf.ConsumerAckWait,
-		MaxAckPending: c.conf.ConsumerMaxAckPending,
-		FilterSubject: topic,
+		Durable:           c.conf.ConsumerGroup,
+		AckPolicy:         jetstream.AckExplicitPolicy,
+		AckWait:           c.conf.ConsumerAckWait,
+		MaxAckPending:     c.conf.ConsumerMaxAckPending,
+		FilterSubject:     topic,
+		MaxWaiting:        max(2, c.conf.ConsumerPullWorkers*2),
+		MaxRequestBatch:   max(1, c.conf.ConsumerPullBatchSize),
+		MaxRequestExpires: fetchMaxWait(c.conf),
 	}
 	if c.conf.ConsumerStartAtNew {
 		consumerCfg.DeliverPolicy = jetstream.DeliverNewPolicy
@@ -127,40 +132,37 @@ func (c *natsConsumer) Consume(ctx context.Context, topic string, handler func(m
 		return err
 	}
 
-	go pollConsumerMetrics(ctx, cons)
+	consumeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	iter, err := cons.Consume(func(jsMsg jetstream.Msg) {
-		headers := make(map[string][]byte, len(jsMsg.Headers()))
-		for key, values := range jsMsg.Headers() {
-			if len(values) == 0 {
-				continue
-			}
-			headers[key] = []byte(values[0])
-		}
+	go pollConsumerMetrics(consumeCtx, cons)
 
-		msg := &Msg{
-			Payload:   append([]byte(nil), jsMsg.Data()...),
-			Subject:   jsMsg.Subject(),
-			Timestamp: time.Now().UnixNano(),
-			Headers:   headers,
-			ackFn:     jsMsg.Ack,
-			nakFn:     jsMsg.Nak,
-			termFn:    jsMsg.Term,
-		}
-
-		if err := handler(msg); err != nil && !msg.Settled() {
-			if nakErr := msg.Nak(); nakErr != nil {
-				log.Printf("NATS negative ack failed: %v", nakErr)
-			}
-		}
-	})
-	if err != nil {
-		return err
+	fetchWorkers := max(1, c.conf.ConsumerPullWorkers)
+	errCh := make(chan error, fetchWorkers)
+	var wg sync.WaitGroup
+	for worker := 0; worker < fetchWorkers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.pullLoop(consumeCtx, cons, max(1, c.conf.ConsumerPullBatchSize), fetchMaxWait(c.conf), handler, errCh)
+		}()
 	}
 
-	<-ctx.Done()
-	iter.Stop()
-	return nil
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-consumeCtx.Done():
+		<-done
+		return nil
+	case err := <-errCh:
+		cancel()
+		<-done
+		return err
+	}
 }
 
 func (c *natsConsumer) Close() error {
@@ -204,9 +206,89 @@ func pollConsumerMetrics(ctx context.Context, cons jetstream.Consumer) {
 	}
 }
 
+func (c *natsConsumer) pullLoop(ctx context.Context, cons jetstream.Consumer, batchSize int, maxWait time.Duration, handler func(msg *Msg) error, errCh chan<- error) {
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		batch, err := cons.Fetch(batchSize, jetstream.FetchMaxWait(maxWait))
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			sendConsumeErr(errCh, err)
+			return
+		}
+
+		for jsMsg := range batch.Messages() {
+			msg := wrapJetStreamMessage(jsMsg)
+			if err := handler(msg); err != nil && !msg.Settled() {
+				if nakErr := msg.Nak(); nakErr != nil {
+					log.Printf("NATS negative ack failed: %v", nakErr)
+				}
+			}
+			if ctx.Err() != nil {
+				return
+			}
+		}
+
+		if batchErr := batch.Error(); batchErr != nil &&
+			!errors.Is(batchErr, jetstream.ErrNoMessages) &&
+			!errors.Is(batchErr, nats.ErrTimeout) {
+			if ctx.Err() != nil {
+				return
+			}
+			sendConsumeErr(errCh, batchErr)
+			return
+		}
+	}
+}
+
+func wrapJetStreamMessage(jsMsg jetstream.Msg) *Msg {
+	headers := make(map[string][]byte, len(jsMsg.Headers()))
+	for key, values := range jsMsg.Headers() {
+		if len(values) == 0 {
+			continue
+		}
+		headers[key] = []byte(values[0])
+	}
+
+	return &Msg{
+		Payload:   append([]byte(nil), jsMsg.Data()...),
+		Subject:   jsMsg.Subject(),
+		Timestamp: time.Now().UnixNano(),
+		Headers:   headers,
+		ackFn:     jsMsg.Ack,
+		nakFn:     jsMsg.Nak,
+		termFn:    jsMsg.Term,
+	}
+}
+
+func sendConsumeErr(errCh chan<- error, err error) {
+	select {
+	case errCh <- err:
+	default:
+	}
+}
+
+func fetchMaxWait(cfg *config.Config) time.Duration {
+	if cfg.ConsumerFetchMaxWait > 0 {
+		return cfg.ConsumerFetchMaxWait
+	}
+	return 250 * time.Millisecond
+}
+
 func streamStorage(cfg *config.Config) jetstream.StorageType {
 	if cfg.StreamStorage == "memory" {
 		return jetstream.MemoryStorage
 	}
 	return jetstream.FileStorage
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
