@@ -1,47 +1,47 @@
 # I Finally Got a Clean Protobuf → Arrow Pipeline—Then the Bottleneck Moved
 
-A friend of mine built a library that immediately made me rethink a bunch of ingestion code I had accepted as inevitable.
+A friend of mine built something that forced me to rethink a chunk of ingestion code I had quietly accepted as inevitable.
 
-It is called `bufarrowlib`, and the idea is almost suspiciously clean:
+It’s called `[bufarrowlib](https://github.com/loicalleyne/bufarrowlib)`. The idea is almost suspiciously clean: take raw Protobuf wire bytes, point the library at a descriptor, and emit Apache Arrow RecordBatches directly—no generated Go structs, no hand-written `RecordBuilder` glue, no second pass.
 
-take raw Protobuf wire bytes, point the library at a descriptor, and write Apache Arrow batches directly without the usual detour through generated Go structs and hand-written `RecordBuilder` glue.
+If you’ve built enough pipelines, that pitch lands right in the scar tissue.
 
-If you have built enough pipelines, that pitch hits right in the scar tissue.
+Because the “normal” pipeline usually looks like this:
 
-Because the normal pipeline usually looks like this:
+1. Receive bytes from Kafka or NATS
+2. Decode into generated structs
+3. Walk those structs again to populate Arrow builders
+4. Rebuild that mapping every time the schema gets interesting
 
-1. receive bytes from Kafka or NATS
-2. decode into generated structs
-3. walk those structs again to fill Arrow builders
-4. redo the mapping every time the schema gets interesting
+That is wasted motion: CPU, allocations, and code nobody wants to maintain.
 
-That is a lot of CPU, a lot of allocation, and a lot of code nobody actually wants to own.
+`bufarrowlib` deletes that entire layer.
 
-`bufarrowlib` goes after that entire layer.
+---
 
-## Why I Built A Whole Harness Around It
+## Why I Built a Harness Around It
 
-The reason I got excited is that I work on systems where the ingestion path matters as much as the analytics path. If the first hop is expensive, every downstream optimization is fighting uphill.
+I work on systems where the ingestion path matters as much as the analytics path. If the first hop is expensive, everything downstream is compensating for it.
 
-So when my friend showed me a library that could go from raw wire bytes to Arrow memory directly, I did not want a toy benchmark. I wanted to know:
+So when I saw a library that goes straight from wire bytes to Arrow memory, I didn’t want a toy benchmark. I wanted to know:
 
-- does this hold up under real broker pressure?
-- what does denormalization actually cost?
-- when does HyperType help enough to matter?
-- where does the bottleneck move once decoding gets cheaper?
+* Does this hold under real broker pressure?
+* What does denormalization actually cost?
+* When does HyperType meaningfully help?
+* Where does the bottleneck move once decoding gets cheap?
 
-That is why I built ArrowFlow: not as a microbenchmark, but as a way to push the whole path until the real bottlenecks showed up.
+That’s why I built [ArrowFlow](https://github.com/TFMV/arrowflow): not a microbenchmark, but a harness to push the entire path until the real constraints show up.
 
-## The Pipeline I Wanted To Measure
+---
 
-ArrowFlow is a Go harness around four moving pieces:
+## The Pipeline
 
-- a synthetic Protobuf event generator
-- a NATS JetStream transport layer
-- a `bufarrowlib` consumer with optional HyperType JIT parsing
-- an Arrow batch flush path with denormalized and nested modes
+ArrowFlow wraps four moving pieces:
 
-At a high level, the system looks like this:
+* A synthetic Protobuf event generator
+* A NATS JetStream transport layer
+* A `bufarrowlib` consumer (optionally using HyperType JIT parsing)
+* An Arrow batch flush path (nested or denormalized)
 
 ```mermaid
 flowchart LR
@@ -51,396 +51,278 @@ flowchart LR
     D --> E["Ack after successful batch output"]
 ```
 
-That last step matters more than it looks. In a real streaming system, the right place to ack is after the Arrow write path succeeds, not when the message merely lands in an in-process queue.
+That last step matters: in a real system, you acknowledge after the Arrow write succeeds—not when the message merely lands in memory.
 
-## What I Like About `bufarrowlib`
+---
 
-The library is interesting to me because it changes where complexity lives.
+## What’s Interesting About `bufarrowlib`
 
-Instead of writing procedural mapping code, you declare the shape you want.
+The key shift is *where complexity lives*.
 
-A simplified setup from ArrowFlow looks like this:
+Instead of procedural mapping code, you declare the shape you want.
 
 ```go
-fd, err := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
-if err != nil {
-	return nil, err
-}
-
-md, err := ba.GetMessageDescriptorByName(fd, "Event")
-if err != nil {
-	return nil, err
-}
+fd, _ := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
+md, _ := ba.GetMessageDescriptorByName(fd, "Event")
 
 ht := ba.NewHyperType(md, ba.WithAutoRecompile(0, 1.0))
 
 opts := []ba.Option{
-	ba.WithHyperType(ht),
-	ba.WithDenormalizerPlan(
-		pbpath.PlanPath("schema_version"),
-		pbpath.PlanPath("event_timestamp"),
-		pbpath.PlanPath("user.user_id"),
-		pbpath.PlanPath("session.session_id"),
-		pbpath.PlanPath("tracing.trace_id"),
-		pbpath.PlanPath("payload.event_type"),
-		pbpath.PlanPath("metrics[*].name"),
-		pbpath.PlanPath("tags[*].key"),
-	),
+    ba.WithHyperType(ht),
+    ba.WithDenormalizerPlan(
+        pbpath.PlanPath("schema_version"),
+        pbpath.PlanPath("event_timestamp"),
+        pbpath.PlanPath("user.user_id"),
+        pbpath.PlanPath("session.session_id"),
+        pbpath.PlanPath("tracing.trace_id"),
+        pbpath.PlanPath("payload.event_type"),
+        pbpath.PlanPath("metrics[*].name"),
+        pbpath.PlanPath("tags[*].key"),
+    ),
 }
 
-tc, err := ba.New(md, memory.DefaultAllocator, opts...)
+_, _ = ba.New(md, memory.DefaultAllocator, opts...)
 ```
 
-That denorm plan is the whole point. The interesting thing is not just that the library understands Protobuf. It is that it lets you describe the Arrow shape you want without writing the usual pile of structural traversal code by hand.
+The `pbpath` layer is the real idea. It’s a declarative field-selection language:
 
-The repeated fields are explicit:
+* Dot notation for scalars
+* `[*]` for repeated fields
 
-- `metrics[*].name`
-- `tags[*].key`
+You’re not describing traversal—you’re describing the Arrow schema you want. The library handles flattening, fanout, null-filling, and cross-joins.
 
-That means the fanout is not hypothetical. The transcoder is really flattening repeated structures into Arrow rows.
+What used to be hundreds of lines of nested loops becomes a list of paths.
 
-## The Benchmarking Change That Finally Made The Numbers Honest
+---
 
-The biggest harness improvement was embarrassingly simple:
+## The Benchmarks That Actually Matter
 
-stop generating payloads while the timer is running
+I started with the library’s own benchmarks, but swapped in a realistic corpus: 506 BidRequest messages, 75% with two impressions, all fields populated.
 
-Every timed mode in ArrowFlow now starts by preparing a bounded corpus of raw Protobuf wire bytes. Then the benchmark replays that corpus.
+Single-threaded (i7-13700H):
 
-- `direct` replays it in process
-- `stress` replays the same corpus across multiple rate targets
-- `stream` replays the exact same raw messages through JetStream
+* Hand-written Arrow getters — 180k msg/s, 5,544 ns/msg, 131 allocs/msg
+* AppendDenorm (proto.Message) — 73k msg/s, 13,662 ns/msg, 230 allocs/msg
+* AppendRaw (HyperType) — 151k msg/s, 6,606 ns/msg, 98 allocs/msg
+* AppendDenormRaw (HyperType) — **296k msg/s**, 3,376 ns/msg, 57 allocs/msg
+* AppendDenormRaw (no HyperType) — 47k msg/s, 21,094 ns/msg, 275 allocs/msg
 
-That means the timed path is now measuring replay, transport, parsing, Arrow append, and batch flush.
+The important number:
 
-Not random string generation.
-Not `crypto/rand`.
-Not a synthetic producer fighting the consumer for CPU while pretending to be part of the ingestion library.
+**AppendDenormRaw with HyperType beats hand-written Arrow getters by 39%, with 57% fewer allocations.**
 
-The warmup path looks like this:
+That’s not just faster—it’s structurally cheaper. Lower allocation pressure compounds under sustained load.
 
-```go
-corpusPlan, err := producer.PrepareRawCorpus(
-	producer.WireConfig{SizeDist: "heavy-tail", SchemaVersion: "1.0.0"},
-	producer.CorpusOptions{TargetMessages: 100000, PilotMessages: 1024},
-)
-if err != nil {
-	return err
-}
+---
 
-corpus := corpusPlan.Messages
-if err := warmTranscoder(base, ht, denorm, corpus); err != nil {
-	return err
-}
-```
+## Concurrency and Scaling
 
-And in stream mode, the timed producer just replays those same raw payloads into NATS:
+AppendRaw scaling (GOMAXPROCS=20):
 
-```go
-raw := nextRaw(shard, &cursor)
-if err := pub.Publish(ctx, topic, &stream.Msg{Payload: raw}); err != nil {
-	return err
-}
-```
+* 1 worker → 79k msg/s
+* 4 workers → 227k msg/s
+* 8 workers → 296k msg/s
+* 16 workers → 406k msg/s
+* 80 workers → 463k msg/s
 
-## The Concurrency Rule You Really Cannot Ignore
+AppendDenormRaw peaks at ~481k msg/s around 16 workers, then flattens.
 
-One detail my friend pushed me on, correctly, is worth being precise about:
+The library isn’t the bottleneck at that point.
 
-- `HyperType` is safe to share
-- `Transcoder` is not
+---
 
-That means the right pattern is not “one HyperType per worker.” It is “one shared HyperType, cloned transcoders per worker.”
+## Batch Size Is Not a Detail
 
-The ArrowFlow worker model is deliberately boring:
+* batch=1 → 6.7k msg/s, 2,446 allocs/msg
+* batch=100 → 102k msg/s, 47 allocs/msg
+* batch=1,000 → 121k msg/s, 26 allocs/msg
+* batch=122,880 → 129k msg/s, 24 allocs/msg
+
+Two practical rules:
+
+* Use batch ≥ 100
+* If writing Parquet, align to 122,880 (DuckDB row group size)
+
+---
+
+## Clone vs New
+
+This one matters more than it should.
+
+* New: ~497µs
+* Clone: ~272µs
+
+Always create one Transcoder, then clone per worker:
 
 ```go
 transcoders := []*ba.Transcoder{base}
 for i := 1; i < workers; i++ {
-	clone, err := base.Clone(memory.NewGoAllocator())
-	if err != nil {
-		return err
-	}
-	transcoders = append(transcoders, clone)
+    clone, _ := base.Clone(memory.NewGoAllocator())
+    transcoders = append(transcoders, clone)
 }
 ```
 
-Under the hood, those clones keep sharing the same `*HyperType`, which is exactly what you want. You pay the compile cost once, warm it up once, then keep worker-local append state.
+Creating transcoders in the hot loop is self-inflicted damage.
 
-That looks like a small detail, but it is the difference between a serious pipeline and a benchmark that lies to you.
+---
 
-Each worker gets:
+## The Concurrency Rule You Can’t Ignore
 
-- its own transcoder clone
-- access to the same HyperType
-- its own append path
-- its own batch flush cadence
+* `HyperType` is safe to share
+* `Transcoder` is not
 
-That keeps the library in the space it was designed for, and it keeps the benchmark from smuggling shared-state problems into the results.
+Correct pattern:
 
-## The Systems Detail That Matters Most
+* One shared HyperType
+* One Transcoder per worker (via Clone)
 
-Once I had a reliable broker path in place, the core ingestion loop became this:
+That’s the difference between a real system and a misleading benchmark.
 
-```go
-for item := range wc.inputChan {
-	raw := item.msg.Payload
+---
 
-	if err := tc.AppendDenormRaw(raw); err != nil {
-		_ = item.msg.Term()
-		continue
-	}
+## Python Bindings
 
-	pending = append(pending, item.msg)
-	if len(pending) >= wc.batchSize {
-		flushBatch(tc, pending)
-		pending = pending[:0]
-	}
-}
+`pybufarrow` exposes the same pipeline through the Arrow C Data Interface—zero-copy between Go and Python.
+
+```python
+from pybufarrow import HyperType, Transcoder
+
+ht = HyperType("events.proto", "UserEvent")
+
+with Transcoder.from_proto_file("events.proto", "UserEvent", hyper_type=ht) as tc:
+    for raw in kafka_consumer:
+        tc.append(raw)
+    batch = tc.flush()
+    df = batch.to_pandas()
 ```
 
-And the important part of `flushBatch` is not the batch creation itself. It is the settlement rule:
+Same model, same lifecycle, no serialization boundary.
 
-```go
-rec := tc.NewDenormalizerRecordBatch()
-defer rec.Release()
+---
 
-for _, msg := range pending {
-	if err := msg.Ack(); err != nil {
-		log.Printf("batch ack failed: %v", err)
-	}
-}
-```
+## Making the Benchmark Honest
 
-This is one of those systems details that sounds boring until it is wrong.
+The biggest fix was simple: stop generating payloads during the timed run.
 
-When it is wrong, you get benchmarks that look fast and pipelines that lose data.
+ArrowFlow prebuilds a corpus of raw wire messages and replays it. The benchmark measures:
 
-## The Broker Setup I Used
+* Transport
+* Parsing
+* Arrow append
+* Batch flush
 
-For the latest run I used a 3-node JetStream cluster, file-backed, with `Replicas=3`.
+—not random data generation competing for CPU.
 
-That matters because I was not interested in measuring a local happy-path publish loop. I wanted to know what happens once coordination is part of the hot path.
+---
 
-The topology is simple:
+## Streaming Setup
 
-```mermaid
-flowchart LR
-    P["ArrowFlow producer"] --> N1["nats-1"]
-    P --> N2["nats-2"]
-    P --> N3["nats-3"]
+3-node JetStream cluster, file-backed, replicas=3—all on one machine.
 
-    subgraph JetStream Cluster
-        N1 <--> N2
-        N2 <--> N3
-        N1 <--> N3
-    end
+Not truly distributed, but enough to expose coordination cost.
 
-    N1 --> C["ArrowFlow consumer group"]
-    N2 --> C
-    N3 --> C
-```
+---
 
-All three nodes were on one machine, so this is still single-host cluster behavior, not a true multi-host distributed benchmark. But it is enough to expose the coordination cost, which is what I cared about most for this round.
+## What the Streaming Numbers Say
 
-## What The Numbers Actually Say
+Direct replay (nested, 8 workers):
 
-After fixing several harness issues that were masking configuration differences, I reran the full STREAM suite and rebuilt the timed modes around corpus replay.
+* **182,999 msg/s**
+* **476 MB/s**
 
-The data lives in `results/all-experiments/results.csv`, but the most interesting parts are easy to summarize.
+Denormalized:
 
-### The direct path is the first thing I wanted to sanity-check
+* 113,801 msg/s
+* 296 MB/s
 
-Before talking about the broker, I wanted to know whether I was using `bufarrowlib` correctly.
+Conclusion: the library isn’t the bottleneck.
 
-The first direct replay result that made me relax was the nested path on a fixed corpus:
+HyperType improves latency significantly (~1.5x), but throughput gains flatten in streaming mode. Once coordination dominates, making the consumer faster mostly reduces latency—not total throughput.
 
-- `100000` prebuilt messages
-- fixed `1024`-byte target size
-- `8` workers
-- `batch=2000`
-- HyperType enabled
+Batch size tradeoff (50k msg/s offered load):
 
-That landed at:
+* Larger batches → more memory, worse latency
+* Sweet spot ~100
 
-- `182999.32 msg/s`
-- `476.36 MB/s`
+Denormalization:
 
-And the denormalized version of the same replay still cleared the line comfortably:
+* Slightly lower throughput
+* Slightly *lower latency*
 
-- `113801.76 msg/s`
-- `296.62 MB/s`
+Once coordination dominates, “faster locally” and “faster end-to-end” diverge.
 
-Then I ran the heavier rate-limited replay with heavy-tail payloads:
+---
 
-- `50000.70 msg/s` for `10s`
-- `445.96 MB/s`
-- `89.7 us` mean consume latency
-- `8.9 us` mean batch-output latency
+## Where the System Breaks
 
-That was the first reassuring number in the whole project.
+Saturation peaked around:
 
-It told me the low STREAM numbers were not “`bufarrowlib` is slow.”
+* ~5.8k msg/s observed
+* 43µs consume latency
+* 1.36ms produce latency
 
-They were “the bottleneck moved.”
+When direct replay clears 100k+ msg/s and the cluster tops out at ~6k, the conclusion is unavoidable:
 
-### HyperType is not a rounding error, but it is not the system ceiling either
+**the bottleneck moved.**
 
-On the replicated STREAM path, mean consume latency dropped by:
+---
 
-- `1.43x` on small messages: `20.6 us` -> `14.4 us`
-- `1.61x` on medium messages: `34.7 us` -> `21.6 us`
-- `1.52x` on large messages: `160.3 us` -> `105.5 us`
-- `1.53x` on heavy-tail messages: `73.1 us` -> `47.8 us`
+## The Shift
 
-That is strong enough that I would enable it by default unless I had a very specific reason not to.
+At some point, this stops being about parsing.
 
-The interesting wrinkle is that throughput did not improve with it in the crossover STREAM runs. HyperType made the consumer cheaper, but the end-to-end rate stayed flat or slipped slightly because the broker path was already the thing deciding the pace.
+The system transitions from:
 
-### The best STREAM batch size was actually `100`
+* CPU-bound → coordination-bound
+* decoding → admission control
+* local efficiency → distributed backpressure
 
-At `50000 msg/s` offered load with heavy-tail payloads:
+The chaos run made it visible:
 
-- `batch=100` reached `5419.90 msg/s`, `45.2 us` mean consume latency, `473.48 MB` heap
-- `batch=500` reached `4936.59 msg/s`, `47.0 us`, `689.71 MB` heap
-- `batch=1000` reached `4750.48 msg/s`, `49.2 us`, `856.66 MB` heap
-- `batch=5000` reached `3761.00 msg/s`, `69.5 us`, `1666.72 MB` heap
-- `batch=10000` reached `3416.62 msg/s`, `76.3 us`, `2425.05 MB` heap
+* Rising buffer depth
+* Growing consumer lag
+* Stable broker, stressed edges
 
-This is exactly the trade you would expect in a real pipeline: after a point, “bigger batch” mostly means “more queued memory.”
+The pressure shows up first in batching and buffering—not immediate collapse.
 
-### Denormalization was the real surprise
+---
 
-The surprise changed once the benchmark got cleaner.
+## Why This Library Matters
 
-At `50000 msg/s` offered load:
+`bufarrowlib` isn’t just faster—it removes an entire class of code:
 
-- nested mode: `5189.99 msg/s`, `52.2 us` mean consume latency
-- denorm mode: `4803.75 msg/s`, `47.9 us` mean consume latency
+* No generated struct churn
+* No manual field mapping
+* No intermediate object graphs
+* Fewer copies before Arrow
 
-And this was not fake fanout. The heavy-tail denorm path averaged:
+And it does it while beating hand-written implementations on realistic data.
 
-- `72.36x` denorm fanout
-- `8` Arrow columns in the selected plan
-- `69,314` average rows per emitted batch in the denorm run
+That’s the real claim.
 
-The updated lesson is more nuanced than the earlier run.
+The intermediate Go struct was never fundamental. It was just the least bad option we had.
 
-Denorm was still cheaper inside the consumer. Mean consume latency was lower even with all that fanout.
+---
 
-But end-to-end throughput still favored nested output on the replicated STREAM path.
+## The Part That Sticks
 
-That tells me the extra cost moved somewhere outside the local append path. Once the hot path becomes coordination-bound, “faster inside the transcoder” and “higher end-to-end throughput” stop being the same statement.
+The real takeaway isn’t “this library is fast.”
 
-That result is specific to this event shape and this denorm plan, but it is still impressive. My friend’s library is doing real structural work here, not just flattening a few scalars.
+It’s this:
 
-### The broker path became the long pole
+* Direct Protobuf → Arrow is a real systems win
+* HyperType compounds under concurrency
+* Denormalization can still clear 100k+ msg/s
+* Batch size and cloning decisions are first-order effects
+* And when you fix ingestion…
 
-The saturation sweep peaked at:
+**the bottleneck moves exactly where it should**
 
-- `5889.87 msg/s` observed throughput at `200000 msg/s` offered load
-- `43.4 us` mean consume latency
-- `1.36 ms` mean produce latency
+From parsing to coordination.
+From CPU to replication.
+From code to queues.
 
-The point is not that `200000` is some magic offered rate.
+That’s the result worth trusting.
 
-The point is that once the direct replay path is comfortably above `100k msg/s`, a replicated single-host JetStream cluster topping out around `5k-6k msg/s` becomes impossible to miss.
+---
 
-That last number is the tell.
-
-Once the parser and Arrow append path get cheap enough, the bottleneck moves out toward:
-
-- replicated broker admission
-- producer-side backpressure
-- batch cadence
-- queue depth
-
-That is exactly the shift I wanted the harness to expose. Once the local decode path gets good enough, the bottleneck stops hiding.
-
-## The Moment The Bottleneck Moved
-
-At some point in this run, the results stopped being about parsing.
-
-The numbers flattened, but not because the system was idle.
-
-They flattened because the hot path had moved.
-
-Not inside the process.
-Not inside the library.
-
-Out into the broker.
-
-Once Protobuf decoding and Arrow writes got cheap enough, the system stopped being CPU-bound and became coordination-bound.
-
-That is the line I was trying to find.
-
-## Where The System Actually Starts To Bend
-
-One thing I like about this run is that the failure surfaces are visible.
-
-At high saturation and in chaos mode, the system did not primarily collapse into broker lag. It tended to accumulate in-process buffer depth first.
-
-The chaos run looked like this:
-
-- `89893` consumed messages in `20s`
-- `1.74 ms` mean produce latency
-- `48.2 us` mean consume latency
-- `238.38 MB` heap allocation
-- `7821` peak buffer depth
-- `298` peak consumer lag
-
-That tells me the first pressure surface in this environment is consumer-side buffering and batch formation, not the broker falling irrecoverably behind.
-
-## The Worker Story Was Less Exciting Than People Usually Hope
-
-I also swept worker counts, because everybody always asks whether more goroutines fix the problem.
-
-At `50000 msg/s` offered load:
-
-- `2 workers`: `3047.43 msg/s`, `34.9 us` mean consume latency
-- `4 workers`: `3997.27 msg/s`, `45.5 us`
-- `8 workers`: `4806.68 msg/s`, `48.9 us`
-- `16 workers`: `4590.07 msg/s`, `60.8 us`
-
-So no, this was still not a case where “just add workers” solved everything. But once I fixed the single-callback fetch path, workers finally started to matter in the place they should have mattered: broker pull concurrency. They just stopped helping before `16`.
-
-## Why I Think `bufarrowlib` Matters
-
-What my friend built is not just a faster parser.
-
-It is a library that removes an entire category of ingestion code:
-
-- less generated-struct churn
-- less handwritten field mapping
-- less object materialization
-- fewer copies before Arrow
-
-That is the architectural win.
-
-The performance win is real, but the bigger idea is that the intermediate Go struct was never a law of nature. It was just the thing most of us tolerated because the alternatives were worse.
-
-`bufarrowlib` is the first Go library I have used in this space that made that assumption feel unnecessary.
-
-## The Part I Keep Coming Back To
-
-The story I wanted to tell after building ArrowFlow is not “my friend made a magic library.”
-
-It is more interesting than that.
-
-The story is:
-
-- yes, direct Protobuf -> Arrow is a real systems win
-- yes, HyperType materially improves the hot path
-- yes, real denormalization can still be fast enough to cross `100k msg/s` on replay
-- and once those pieces get efficient enough, the bottleneck moves exactly where a distributed systems engineer would expect it to move
-
-from parsing to coordination
-
-from local CPU to replicated admission
-
-from clever decode logic to queueing, batching, and backpressure
-
-That is the result I trust most.
-
-And as someone who has spent too much time maintaining the old shape of these pipelines, I am genuinely happy my friend built the thing that made me question it.
