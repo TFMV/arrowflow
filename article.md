@@ -1,8 +1,10 @@
-# I Finally Got a Clean Protobuf → Arrow Pipeline—Then the Bottleneck Moved
+# Protobuf → Arrow in One Hop
+
+## Then the Bottleneck Finally Moved Where It Belongs
 
 A friend of mine built something that forced me to rethink a chunk of ingestion code I had accepted as inevitable.
 
-It’s called [bufarrowlib](https://github.com/loicalleyne/bufarrowlib). The idea is almost suspiciously clean: take raw Protobuf wire bytes, point the library at a descriptor, and emit Apache Arrow RecordBatches directly—no generated Go structs, no hand-written `RecordBuilder` glue, no second pass.
+It’s called [bufarrowlib](https://github.com/loicalleyne/bufarrowlib). The idea is almost suspiciously clean: take raw Protobuf wire bytes, point the library at a descriptor, and emit Apache Arrow `RecordBatch`es directly—no generated Go structs, no hand-written `RecordBuilder` glue, no second pass.
 
 If you’ve built enough pipelines, that pitch lands right in the scar tissue.
 
@@ -40,7 +42,7 @@ ArrowFlow wraps four moving pieces:
 
 * A synthetic Protobuf event generator
 * A NATS JetStream transport layer
-* A `bufarrowlib` consumer (optionally using HyperType JIT parsing)
+* A `bufarrowlib` consumer (optionally using a HyperType JIT-compiled parser via `hyperpb` with profile-guided recompilation)
 * An Arrow batch flush path (nested or denormalized)
 
 ```mermaid
@@ -99,19 +101,16 @@ What used to be hundreds of lines of nested loops becomes a list of paths.
 
 I started with the library’s own benchmarks, but swapped in a realistic corpus: 506 BidRequest messages, 75% with two impressions, all fields populated.
 
-Single-threaded (i7-13700H):
+**Single-threaded (i7-13700H):**
 
 * Hand-written Arrow getters — 180k msg/s, 5,544 ns/msg, 131 allocs/msg
 * AppendDenorm (proto.Message) — 73k msg/s, 13,662 ns/msg, 230 allocs/msg
 * AppendRaw (HyperType) — 151k msg/s, 6,606 ns/msg, 98 allocs/msg
-* AppendDenormRaw (HyperType) — **296k msg/s**, 3,376 ns/msg, 57 allocs/msg
+* **AppendDenormRaw (HyperType) — 296k msg/s, 3,376 ns/msg, 57 allocs/msg**
 * AppendDenormRaw (no HyperType) — 47k msg/s, 21,094 ns/msg, 275 allocs/msg
 
-The important number:
-
-**AppendDenormRaw with HyperType beats hand-written Arrow getters by 39%, with 57% fewer allocations.**
-
-That’s not just faster—it’s structurally cheaper. Lower allocation pressure compounds under sustained load.
+> **AppendDenormRaw with HyperType beats hand-written Arrow getters by 39%, with 57% fewer allocations.**
+> That’s not just faster—it’s structurally cheaper. Lower allocation pressure compounds under sustained load.
 
 ---
 
@@ -145,14 +144,14 @@ Two practical rules:
 
 ---
 
-## Clone vs New
+## Clone vs. New
 
 This one matters more than it should.
 
 * New: ~497µs
 * Clone: ~272µs
 
-Always create one Transcoder, then clone per worker:
+Always create one transcoder, then clone per worker:
 
 ```go
 transcoders := []*ba.Transcoder{base}
@@ -174,15 +173,15 @@ Creating transcoders in the hot loop is self-inflicted damage.
 Correct pattern:
 
 * One shared HyperType
-* One Transcoder per worker (via Clone)
+* One transcoder per worker (via `Clone`)
 
 That’s the difference between a real system and a misleading benchmark.
 
 ---
 
-## Python Bindings
+## Python Bindings (for the data-team crowd)
 
-`pybufarrow` exposes the same pipeline through the Arrow C Data Interface—zero-copy between Go and Python.
+`pybufarrow` exposes the same pipeline through the Arrow C Data Interface—zero-copy between Go and Python. All the heavy lifting (parsing, denormalization, HyperType JIT) stays in Go, so you keep the performance wins without introducing a serialization boundary.
 
 ```python
 from pybufarrow import HyperType, Transcoder
@@ -196,7 +195,8 @@ with Transcoder.from_proto_file("events.proto", "UserEvent", hyper_type=ht) as t
     df = batch.to_pandas()
 ```
 
-Same model, same lifecycle, no serialization boundary.
+**Python-specific performance note:**
+The GIL still applies if you use threads. To get real scaling, use `multiprocessing.Pool` instead of `concurrent.futures.ThreadPoolExecutor`. At just four workers, `Pool` can be **~16× faster** due to GIL behavior. The bindings are designed with this pattern in mind, so the same declarative `pbpath` model and HyperType performance are immediately available to Python-first teams building Kafka → Arrow → Pandas/DuckDB pipelines.
 
 ---
 
@@ -217,7 +217,7 @@ ArrowFlow prebuilds a corpus of raw wire messages and replays it. The benchmark 
 
 ## Streaming Setup
 
-3-node JetStream cluster, file-backed, replicas=3—all on one machine.
+A 3-node JetStream cluster, file-backed, replicas=3—all running on a single machine.
 
 Not truly distributed, but enough to expose coordination cost.
 
@@ -237,17 +237,17 @@ Denormalized:
 
 Conclusion: the library isn’t the bottleneck.
 
-HyperType improves latency significantly (~1.5x), but throughput gains flatten in streaming mode. Once coordination dominates, making the consumer faster mostly reduces latency—not total throughput.
+HyperType improves latency significantly (~1.5×), but throughput gains flatten in streaming mode. Once coordination dominates, making the consumer faster mostly reduces latency—not total throughput.
 
 Batch size tradeoff (50k msg/s offered load):
 
 * Larger batches → more memory, worse latency
-* Sweet spot ~100
+* Sweet spot ≈ 100
 
 Denormalization:
 
 * Slightly lower throughput
-* Slightly *lower latency*
+* Slightly *lower* end-to-end latency (more compact Arrow batches reduce downstream coordination pressure)
 
 Once coordination dominates, “faster locally” and “faster end-to-end” diverge.
 
@@ -296,11 +296,9 @@ The pressure shows up first in batching and buffering—not immediate collapse.
 * No intermediate object graphs
 * Fewer copies before Arrow
 
-And it does it while beating hand-written implementations on realistic data.
+And it does it while beating hand-written implementations on realistic data. The Python bindings make the same wins immediately accessible to teams working in Pandas, Polars, or DuckDB.
 
-That’s the real claim.
-
-The intermediate Go struct was never fundamental. It was just the least bad option we had.
+The intermediate Go struct was never fundamental. It was just the least-bad option we had.
 
 ---
 
@@ -313,7 +311,7 @@ It’s this:
 * Direct Protobuf → Arrow is a real systems win
 * HyperType compounds under concurrency
 * Denormalization can still clear 100k+ msg/s
-* Batch size and cloning decisions are first-order effects
+* Batch size, cloning, and (in Python) `multiprocessing.Pool` decisions are first-order effects
 * And when you fix ingestion…
 
 **the bottleneck moves exactly where it should**
@@ -323,6 +321,3 @@ From CPU to replication.
 From code to queues.
 
 That’s the result worth trusting.
-
----
-
