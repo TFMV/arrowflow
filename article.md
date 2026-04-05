@@ -13,7 +13,7 @@ Because the normal pipeline usually looks like this:
 1. receive bytes from Kafka or NATS
 2. decode into generated structs
 3. walk those structs again to fill Arrow builders
-4. repeat the whole exercise when the schema changes
+4. redo the mapping every time the schema gets interesting
 
 That is a lot of CPU, a lot of allocation, and a lot of code nobody actually wants to own.
 
@@ -72,8 +72,10 @@ if err != nil {
 	return nil, err
 }
 
+ht := ba.NewHyperType(md, ba.WithAutoRecompile(0, 1.0))
+
 opts := []ba.Option{
-	ba.WithHyperType(ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))),
+	ba.WithHyperType(ht),
 	ba.WithDenormalizerPlan(
 		pbpath.PlanPath("schema_version"),
 		pbpath.PlanPath("event_timestamp"),
@@ -98,6 +100,50 @@ The repeated fields are explicit:
 
 That means the fanout is not hypothetical. The transcoder is really flattening repeated structures into Arrow rows.
 
+## The Benchmarking Change That Finally Made The Numbers Honest
+
+The biggest harness improvement was embarrassingly simple:
+
+stop generating payloads while the timer is running
+
+Every timed mode in ArrowFlow now starts by preparing a bounded corpus of raw Protobuf wire bytes. Then the benchmark replays that corpus.
+
+- `direct` replays it in process
+- `stress` replays the same corpus across multiple rate targets
+- `stream` replays the exact same raw messages through JetStream
+
+That means the timed path is now measuring replay, transport, parsing, Arrow append, and batch flush.
+
+Not random string generation.
+Not `crypto/rand`.
+Not a synthetic producer fighting the consumer for CPU while pretending to be part of the ingestion library.
+
+The warmup path looks like this:
+
+```go
+corpusPlan, err := producer.PrepareRawCorpus(
+	producer.WireConfig{SizeDist: "heavy-tail", SchemaVersion: "1.0.0"},
+	producer.CorpusOptions{TargetMessages: 100000, PilotMessages: 1024},
+)
+if err != nil {
+	return err
+}
+
+corpus := corpusPlan.Messages
+if err := warmTranscoder(base, ht, denorm, corpus); err != nil {
+	return err
+}
+```
+
+And in stream mode, the timed producer just replays those same raw payloads into NATS:
+
+```go
+raw := nextRaw(shard, &cursor)
+if err := pub.Publish(ctx, topic, &stream.Msg{Payload: raw}); err != nil {
+	return err
+}
+```
+
 ## The Concurrency Rule You Really Cannot Ignore
 
 One detail my friend pushed me on, correctly, is worth being precise about:
@@ -120,7 +166,7 @@ for i := 1; i < workers; i++ {
 }
 ```
 
-Under the hood, those clones keep sharing the same `*HyperType`, which is exactly what you want. You pay the compile cost once, then keep worker-local append state.
+Under the hood, those clones keep sharing the same `*HyperType`, which is exactly what you want. You pay the compile cost once, warm it up once, then keep worker-local append state.
 
 That looks like a small detail, but it is the difference between a serious pipeline and a benchmark that lies to you.
 
@@ -200,7 +246,7 @@ All three nodes were on one machine, so this is still single-host cluster behavi
 
 ## What The Numbers Actually Say
 
-After fixing several harness issues that were masking configuration differences, I reran the full STREAM suite and added a direct corpus benchmark path that warms HyperType before timing starts.
+After fixing several harness issues that were masking configuration differences, I reran the full STREAM suite and rebuilt the timed modes around corpus replay.
 
 The data lives in `results/all-experiments/results.csv`, but the most interesting parts are easy to summarize.
 
@@ -208,26 +254,30 @@ The data lives in `results/all-experiments/results.csv`, but the most interestin
 
 Before talking about the broker, I wanted to know whether I was using `bufarrowlib` correctly.
 
-One direct benchmark run with:
+The first direct replay result that made me relax was the nested path on a fixed corpus:
 
-- `100000` messages
-- fixed `1024`-byte payloads
+- `100000` prebuilt messages
+- fixed `1024`-byte target size
 - `8` workers
-- `batch=1000`
+- `batch=2000`
 - HyperType enabled
-- denorm enabled
 
-landed at:
+That landed at:
 
-- `91417.93 msg/s`
-- `237.73 MB/s`
+- `182999.32 msg/s`
+- `476.36 MB/s`
 
-And a heavier direct run with heavy-tail payloads sustained:
+And the denormalized version of the same replay still cleared the line comfortably:
 
-- `49999.20 msg/s` for `10s`
-- `444.37 MB/s`
-- `35.8 us` mean consume latency
-- `6.4 us` mean batch-output latency
+- `113801.76 msg/s`
+- `296.62 MB/s`
+
+Then I ran the heavier rate-limited replay with heavy-tail payloads:
+
+- `50000.70 msg/s` for `10s`
+- `445.96 MB/s`
+- `89.7 us` mean consume latency
+- `8.9 us` mean batch-output latency
 
 That was the first reassuring number in the whole project.
 
@@ -235,47 +285,53 @@ It told me the low STREAM numbers were not “`bufarrowlib` is slow.”
 
 They were “the bottleneck moved.”
 
-### HyperType is not a rounding error
+### HyperType is not a rounding error, but it is not the system ceiling either
 
 On the replicated STREAM path, mean consume latency dropped by:
 
-- `2.71x` on small messages: `24.2 us` -> `8.9 us`
-- `2.49x` on medium messages: `36.0 us` -> `14.5 us`
-- `1.39x` on large messages: `158.0 us` -> `113.3 us`
-- `1.90x` on heavy-tail messages: `73.5 us` -> `38.8 us`
+- `1.43x` on small messages: `20.6 us` -> `14.4 us`
+- `1.61x` on medium messages: `34.7 us` -> `21.6 us`
+- `1.52x` on large messages: `160.3 us` -> `105.5 us`
+- `1.53x` on heavy-tail messages: `73.1 us` -> `47.8 us`
 
 That is strong enough that I would enable it by default unless I had a very specific reason not to.
 
-One interesting wrinkle: in STREAM mode, lower consume latency did not always translate into higher throughput. Once the broker was the long pole, some HyperType runs were faster inside the process without moving the end-to-end message rate much.
+The interesting wrinkle is that throughput did not improve with it in the crossover STREAM runs. HyperType made the consumer cheaper, but the end-to-end rate stayed flat or slipped slightly because the broker path was already the thing deciding the pace.
 
-### The best batch size was actually `500`
+### The best STREAM batch size was actually `100`
 
 At `50000 msg/s` offered load with heavy-tail payloads:
 
-- `batch=100` reached `4753.43 msg/s`, `38.3 us` mean consume latency, `37.76 MB` heap
-- `batch=500` reached `4838.98 msg/s`, `35.8 us`, `242.63 MB` heap
-- `batch=1000` reached `4318.51 msg/s`, `39.9 us`, `426.72 MB` heap
-- `batch=5000` reached `3131.43 msg/s`, `53.4 us`, `1944.95 MB` heap
-- `batch=10000` reached `3837.94 msg/s`, `65.1 us`, `2149.75 MB` heap
+- `batch=100` reached `5419.90 msg/s`, `45.2 us` mean consume latency, `473.48 MB` heap
+- `batch=500` reached `4936.59 msg/s`, `47.0 us`, `689.71 MB` heap
+- `batch=1000` reached `4750.48 msg/s`, `49.2 us`, `856.66 MB` heap
+- `batch=5000` reached `3761.00 msg/s`, `69.5 us`, `1666.72 MB` heap
+- `batch=10000` reached `3416.62 msg/s`, `76.3 us`, `2425.05 MB` heap
 
 This is exactly the trade you would expect in a real pipeline: after a point, “bigger batch” mostly means “more queued memory.”
 
 ### Denormalization was the real surprise
 
-For this schema, denormalized output beat nested output.
+The surprise changed once the benchmark got cleaner.
 
 At `50000 msg/s` offered load:
 
-- nested mode: `4492.68 msg/s`, `46.1 us` mean consume latency
-- denorm mode: `4639.97 msg/s`, `36.2 us` mean consume latency
+- nested mode: `5189.99 msg/s`, `52.2 us` mean consume latency
+- denorm mode: `4803.75 msg/s`, `47.9 us` mean consume latency
 
 And this was not fake fanout. The heavy-tail denorm path averaged:
 
-- `71.79x` denorm fanout
+- `72.36x` denorm fanout
 - `8` Arrow columns in the selected plan
-- `69,397` average rows per emitted batch in the denorm run
+- `69,314` average rows per emitted batch in the denorm run
 
-This goes against the usual instinct that fanout is always the expensive path. Here, the structured, columnar write path is cheaper than walking nested structures repeatedly.
+The updated lesson is more nuanced than the earlier run.
+
+Denorm was still cheaper inside the consumer. Mean consume latency was lower even with all that fanout.
+
+But end-to-end throughput still favored nested output on the replicated STREAM path.
+
+That tells me the extra cost moved somewhere outside the local append path. Once the hot path becomes coordination-bound, “faster inside the transcoder” and “higher end-to-end throughput” stop being the same statement.
 
 That result is specific to this event shape and this denorm plan, but it is still impressive. My friend’s library is doing real structural work here, not just flattening a few scalars.
 
@@ -283,11 +339,13 @@ That result is specific to this event shape and this denorm plan, but it is stil
 
 The saturation sweep peaked at:
 
-- `4680.39 msg/s` observed throughput at `150000 msg/s` offered load
-- `39.7 us` mean consume latency
-- `1.71 ms` mean produce latency
+- `5889.87 msg/s` observed throughput at `200000 msg/s` offered load
+- `43.4 us` mean consume latency
+- `1.36 ms` mean produce latency
 
-And `200000 msg/s` did not move it meaningfully beyond that. It came in at `4661.59 msg/s`.
+The point is not that `200000` is some magic offered rate.
+
+The point is that once the direct replay path is comfortably above `100k msg/s`, a replicated single-host JetStream cluster topping out around `5k-6k msg/s` becomes impossible to miss.
 
 That last number is the tell.
 
@@ -325,12 +383,12 @@ At high saturation and in chaos mode, the system did not primarily collapse into
 
 The chaos run looked like this:
 
-- `87418` consumed messages in `20s`
-- `1.79 ms` mean produce latency
-- `34.6 us` mean consume latency
-- `287.25 MB` heap allocation
-- `7875` peak buffer depth
-- `108` peak consumer lag
+- `89893` consumed messages in `20s`
+- `1.74 ms` mean produce latency
+- `48.2 us` mean consume latency
+- `238.38 MB` heap allocation
+- `7821` peak buffer depth
+- `298` peak consumer lag
 
 That tells me the first pressure surface in this environment is consumer-side buffering and batch formation, not the broker falling irrecoverably behind.
 
@@ -340,12 +398,12 @@ I also swept worker counts, because everybody always asks whether more goroutine
 
 At `50000 msg/s` offered load:
 
-- `2 workers`: `2540.71 msg/s`, `31.9 us` mean consume latency
-- `4 workers`: `3249.53 msg/s`, `38.2 us`
-- `8 workers`: `4247.79 msg/s`, `38.6 us`
-- `16 workers`: `4692.71 msg/s`, `47.0 us`
+- `2 workers`: `3047.43 msg/s`, `34.9 us` mean consume latency
+- `4 workers`: `3997.27 msg/s`, `45.5 us`
+- `8 workers`: `4806.68 msg/s`, `48.9 us`
+- `16 workers`: `4590.07 msg/s`, `60.8 us`
 
-So no, this was still not a case where “just add workers” solved everything. But once I fixed the single-callback fetch path, workers finally started to matter in the place they should have mattered: broker pull concurrency.
+So no, this was still not a case where “just add workers” solved everything. But once I fixed the single-callback fetch path, workers finally started to matter in the place they should have mattered: broker pull concurrency. They just stopped helping before `16`.
 
 ## Why I Think `bufarrowlib` Matters
 
@@ -374,7 +432,7 @@ The story is:
 
 - yes, direct Protobuf -> Arrow is a real systems win
 - yes, HyperType materially improves the hot path
-- yes, real denormalization can still be fast
+- yes, real denormalization can still be fast enough to cross `100k msg/s` on replay
 - and once those pieces get efficient enough, the bottleneck moves exactly where a distributed systems engineer would expect it to move
 
 from parsing to coordination

@@ -33,37 +33,37 @@ func (t *Timer) Stop() time.Duration {
 }
 
 type Histogram struct {
-	sum   atomic.Int64
-	count atomic.Int64
-	min   atomic.Int64
-	max   atomic.Int64
-	vals  []float64
-	mu    sync.Mutex
-	size  int
-	next  int
-	full  bool
+	sum     atomic.Int64
+	count   atomic.Int64
+	min     atomic.Int64
+	max     atomic.Int64
+	samples atomic.Uint64
+	vals    []float64
+	mu      sync.Mutex
+	size    int
+	next    int
+	full    bool
 }
 
 func NewHistogram(size int) *Histogram {
 	return &Histogram{vals: make([]float64, 0, size), size: size}
 }
 
+const histogramSampleStride = 8
+
 func (h *Histogram) Observe(v float64) {
+	scaled := int64(v * 1000000000)
+	h.sum.Add(scaled)
+	count := h.count.Add(1)
+	updateMin(&h.min, scaled)
+	updateMax(&h.max, scaled)
+
+	if count%histogramSampleStride != 0 {
+		return
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
-
-	h.sum.Add(int64(v * 1000000000))
-	h.count.Add(1)
-
-	scaled := int64(v * 1000000000)
-	oldMin := h.min.Load()
-	if oldMin == 0 || scaled < oldMin {
-		h.min.Store(scaled)
-	}
-	oldMax := h.max.Load()
-	if scaled > oldMax {
-		h.max.Store(scaled)
-	}
 
 	if len(h.vals) < h.size {
 		h.vals = append(h.vals, v)
@@ -76,6 +76,7 @@ func (h *Histogram) Observe(v float64) {
 
 	h.vals[h.next] = v
 	h.next = (h.next + 1) % h.size
+	h.samples.Add(1)
 }
 
 func (h *Histogram) Stats() (count, min, max, mean, p50, p95, p99, p999 float64) {
@@ -87,6 +88,9 @@ func (h *Histogram) Stats() (count, min, max, mean, p50, p95, p99, p999 float64)
 	min = float64(h.min.Load()) / 1000000000
 	max = float64(h.max.Load()) / 1000000000
 	mean = float64(h.sum.Load()) / 1000000000 / count
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
 	if len(h.vals) > 0 {
 		sorted := make([]float64, len(h.vals))
@@ -239,8 +243,9 @@ func (ld *LatencyDistribution) Observe(name string, seconds float64) {
 		h = NewHistogram(10000)
 		ld.histogram[name] = h
 	}
-	h.Observe(seconds)
 	ld.mu.Unlock()
+
+	h.Observe(seconds)
 }
 
 func (ld *LatencyDistribution) Stats(name string) (count, min, max, mean, p50, p95, p99, p999 float64) {
@@ -250,9 +255,34 @@ func (ld *LatencyDistribution) Stats(name string) (count, min, max, mean, p50, p
 		ld.mu.Unlock()
 		return
 	}
-	count, min, max, mean, p50, p95, p99, p999 = h.Stats()
 	ld.mu.Unlock()
+
+	count, min, max, mean, p50, p95, p99, p999 = h.Stats()
 	return
+}
+
+func updateMin(dst *atomic.Int64, candidate int64) {
+	for {
+		current := dst.Load()
+		if current != 0 && candidate >= current {
+			return
+		}
+		if dst.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
+}
+
+func updateMax(dst *atomic.Int64, candidate int64) {
+	for {
+		current := dst.Load()
+		if candidate <= current {
+			return
+		}
+		if dst.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
 }
 
 func init() {
@@ -358,15 +388,6 @@ func init() {
 func RecordLatency(name string, start time.Time) {
 	duration := time.Since(start).Nanoseconds()
 	globalLatency.Observe(name, float64(duration)/1000000000)
-
-	switch name {
-	case "produce":
-		ProduceLatencyMs.Observe(float64(duration) / 1000000)
-	case "consume":
-		ConsumeLatencyMs.Observe(float64(duration) / 1000000)
-	case "batch_output":
-		BatchOutputLatencyMs.Observe(float64(duration) / 1000000)
-	}
 }
 
 func RecordThroughput(bytes, messages int64) {
@@ -375,39 +396,24 @@ func RecordThroughput(bytes, messages int64) {
 
 func RecordProducedThroughput(bytes, messages int64) {
 	producedThroughput.Add(bytes, messages)
-	MessagesProduced.Add(float64(messages))
-	BytesProduced.Add(float64(bytes))
-
-	msgRate, _ := producedThroughput.Rate()
-	ProducerThroughput.Set(msgRate)
 }
 
 func RecordConsumedThroughput(bytes, messages int64) {
 	globalThroughput.Add(bytes, messages)
-	MessagesConsumed.Add(float64(messages))
-	BytesConsumed.Add(float64(bytes))
-
-	msgRate, _ := globalThroughput.Rate()
-	ConsumerThroughput.Set(msgRate)
 }
 
 func RecordBatchMetrics(rows, cols int, sizeBytes int64, inputMessages int) {
-	RecordBatchSize.Observe(float64(sizeBytes))
-	RecordBatchRows.Observe(float64(rows))
-
 	// Record to internal Stats for GenerateTelemetryReport
 	globalLatency.Observe("batch_size_bytes", float64(sizeBytes))
 	globalLatency.Observe("batch_rows", float64(rows))
 
 	if cols > 0 {
 		expansion := float64(cols)
-		ColumnExpansionFactor.Observe(expansion)
 		globalLatency.Observe("column_expansion", expansion)
 	}
 
 	if inputMessages > 0 {
 		fanout := float64(rows) / float64(inputMessages)
-		DenormFanoutMultiplier.Observe(fanout)
 		globalLatency.Observe("denorm_fanout", fanout)
 	}
 }

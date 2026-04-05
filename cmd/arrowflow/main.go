@@ -334,16 +334,27 @@ type directPipelineConfig struct {
 	EnableHyper bool
 	Denorm      bool
 	FixedSize   int
+	Corpus      *producer.RawCorpus
 }
 
 func runDirectPipeline(parent context.Context, cfg directPipelineConfig) (*ExperimentResult, error) {
-	corpus, err := producer.BuildRawCorpus(producer.WireConfig{
-		SizeDist:      cfg.SizeDist,
-		SchemaVersion: "1.0.0",
-	}, corpusSizeForRun(cfg.Messages, cfg.SizeDist), cfg.FixedSize)
-	if err != nil {
-		return nil, err
+	corpusPlan := cfg.Corpus
+	preparedHere := false
+	if corpusPlan == nil {
+		var err error
+		corpusPlan, err = producer.PrepareRawCorpus(producer.WireConfig{
+			SizeDist:      cfg.SizeDist,
+			SchemaVersion: "1.0.0",
+		}, prepareCorpusOptions(cfg.Messages, cfg.Rate, cfg.Duration, cfg.FixedSize))
+		if err != nil {
+			return nil, err
+		}
+		preparedHere = true
 	}
+	if preparedHere {
+		logPreparedCorpus(cfg.Mode, corpusPlan)
+	}
+	corpus := corpusPlan.Messages
 
 	base, ht, err := newTranscoder(cfg.EnableHyper, cfg.Denorm)
 	if err != nil {
@@ -497,13 +508,15 @@ func runStreamExperiment(parent context.Context, cfg streamExperimentConfig) (*E
 
 	var corpus [][]byte
 	if cfg.Injector == nil {
-		corpus, err = producer.BuildRawCorpus(producer.WireConfig{
+		corpusPlan, prepErr := producer.PrepareRawCorpus(producer.WireConfig{
 			SizeDist:      cfg.SizeDist,
 			SchemaVersion: "1.0.0",
-		}, corpusSizeForRun(0, cfg.SizeDist), 0)
-		if err != nil {
-			return nil, err
+		}, prepareCorpusOptions(0, cfg.Rate, cfg.Duration, 0))
+		if prepErr != nil {
+			return nil, prepErr
 		}
+		logPreparedCorpus("stream", corpusPlan)
+		corpus = corpusPlan.Messages
 		if err := wireConsumer.Warmup(corpus); err != nil {
 			return nil, err
 		}
@@ -637,6 +650,15 @@ type stressConfig struct {
 }
 
 func runStressCollapse(ctx context.Context, cfg stressConfig) error {
+	corpusPlan, err := producer.PrepareRawCorpus(producer.WireConfig{
+		SizeDist:      cfg.SizeDist,
+		SchemaVersion: "1.0.0",
+	}, prepareCorpusOptions(0, cfg.MaxRate, cfg.Duration, 0))
+	if err != nil {
+		return err
+	}
+	logPreparedCorpus("stress", corpusPlan)
+
 	rates := []int{1000, 5000, 10000, 25000, 50000, 75000, 100000}
 	for _, rate := range rates {
 		if rate > cfg.MaxRate {
@@ -651,6 +673,7 @@ func runStressCollapse(ctx context.Context, cfg stressConfig) error {
 			SizeDist:    cfg.SizeDist,
 			EnableHyper: cfg.EnableHyper,
 			Denorm:      cfg.Denorm,
+			Corpus:      corpusPlan,
 		})
 		if err != nil {
 			return err
@@ -695,7 +718,7 @@ func newTranscoder(enableHyper, denorm bool) (*ba.Transcoder, *ba.HyperType, err
 	var ht *ba.HyperType
 	var opts []ba.Option
 	if enableHyper {
-		ht = ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))
+		ht = ba.NewHyperType(md, ba.WithAutoRecompile(0, 1.0))
 		opts = append(opts, ba.WithHyperType(ht))
 	}
 	if denorm {
@@ -777,16 +800,49 @@ func releaseTranscoders(transcoders []*ba.Transcoder) {
 	}
 }
 
-func corpusSizeForRun(messages int, sizeDist string) int {
-	size := 8192
-	switch sizeDist {
-	case "large", "heavy-tail":
-		size = 4096
+func prepareCorpusOptions(messages, rate int, duration time.Duration, fixedSize int) producer.CorpusOptions {
+	if messages > 0 {
+		return producer.CorpusOptions{
+			TargetMessages: messages,
+			FixedSize:      fixedSize,
+			PilotMessages:  1024,
+		}
 	}
-	if messages > 0 && messages < size {
+
+	return producer.CorpusOptions{
+		TargetMessages: desiredCorpusMessages(messages, rate, duration),
+		FixedSize:      fixedSize,
+		PilotMessages:  1024,
+		MaxMessages:    65536,
+		MaxBytes:       256 << 20,
+	}
+}
+
+func desiredCorpusMessages(messages, rate int, duration time.Duration) int {
+	if messages > 0 {
 		return messages
 	}
-	return size
+	if rate > 0 && duration > 0 {
+		target := int(float64(rate)*duration.Seconds() + 0.5)
+		if target > 0 {
+			return target
+		}
+	}
+	return 32768
+}
+
+func logPreparedCorpus(mode string, corpus *producer.RawCorpus) {
+	if corpus == nil {
+		return
+	}
+	log.Printf(
+		"Prepared corpus for %s: %d messages replayable (%d desired, %.2f MB total, avg %d bytes)",
+		mode,
+		len(corpus.Messages),
+		corpus.DesiredMessages,
+		float64(corpus.TotalBytes)/1024/1024,
+		corpus.AvgBytes,
+	)
 }
 
 func shardCorpus(corpus [][]byte, workers int) [][][]byte {

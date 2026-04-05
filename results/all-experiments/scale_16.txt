@@ -1,48 +1,49 @@
-2026/04/05 00:21:55 Worker 12: processed 5 batches
-2026/04/05 00:21:55 Worker 4: processed 5 batches
-2026/04/05 00:21:55 Worker 10: processed 5 batches
-2026/04/05 00:21:55 Worker 2: processed 5 batches
-2026/04/05 00:21:55 Worker 11: processed 5 batches
-2026/04/05 00:21:55 Worker 13: processed 5 batches
-2026/04/05 00:21:55 Worker 7: processed 5 batches
-2026/04/05 00:21:55 Worker 6: processed 5 batches
-2026/04/05 00:21:55 Worker 14: processed 5 batches
-2026/04/05 00:21:55 Worker 5: processed 5 batches
-2026/04/05 00:21:55 Worker 15: processed 5 batches
-2026/04/05 00:21:55 Worker 8: processed 5 batches
-2026/04/05 00:21:55 Worker 0: processed 5 batches
-2026/04/05 00:21:55 Worker 9: processed 5 batches
-2026/04/05 00:21:55 Worker 1: processed 5 batches
-2026/04/05 00:21:55 Worker 3: processed 5 batches
+2026/04/05 08:14:18 Prepared corpus for stream: 27799 messages replayable (750000 desired, 248.58 MB total, avg 9376 bytes)
+2026/04/05 08:14:49 Worker 1: processed 5 batches
+2026/04/05 08:14:49 Worker 7: processed 5 batches
+2026/04/05 08:14:49 Worker 3: processed 5 batches
+2026/04/05 08:14:49 Worker 15: processed 5 batches
+2026/04/05 08:14:49 Worker 13: processed 5 batches
+2026/04/05 08:14:49 Worker 14: processed 5 batches
+2026/04/05 08:14:49 Worker 12: processed 5 batches
+2026/04/05 08:14:49 Worker 10: processed 5 batches
+2026/04/05 08:14:49 Worker 6: processed 5 batches
+2026/04/05 08:14:49 Worker 2: processed 5 batches
+2026/04/05 08:14:49 Worker 5: processed 5 batches
+2026/04/05 08:14:49 Worker 11: processed 5 batches
+2026/04/05 08:14:49 Worker 8: processed 5 batches
+2026/04/05 08:14:49 Worker 4: processed 5 batches
+2026/04/05 08:14:49 Worker 0: processed 5 batches
+2026/04/05 08:14:49 Worker 9: processed 5 batches
 Experiment Results:
   Mode: stream
-  Duration: 15.000081875s
-  Messages: 70391
-  Rate: 4692.71 msg/s
+  Duration: 14.99997425s
+  Messages: 68851
+  Rate: 4590.07 msg/s
 === ArrowFlow Telemetry Report ===
-Timestamp: 2026-04-05T00:21:55-05:00
+Timestamp: 2026-04-05T08:14:49-05:00
 
 Throughput:
-  Messages/sec: 2330.12
-  Bytes/sec:    19.81 MB/s
-  Total:        70391 messages, 598.49 MB
+  Messages/sec: 2272.45
+  Bytes/sec:    20.37 MB/s
+  Total:        68851 messages, 617.20 MB
 
 Latency (ns):
-  Produce:      mean=3408294, p50=2486125, p95=8023750, p99=35460792, p99.9=125507708
-  Consume:      mean=46992, p50=32334, p95=134583, p99=298542, p99.9=934000
-  Batch Output: mean=16859, p50=9583, p95=55125, p99=77958, p99.9=77958
+  Produce:      mean=3485137, p50=2451375, p95=7108708, p99=22375125, p99.9=94667125
+  Consume:      mean=60763, p50=42334, p95=149167, p99=330083, p99.9=1368375
+  Batch Output: mean=16430, p50=6333, p95=39875, p99=39875, p99.9=39875
 
 Memory:
-  Heap Alloc:  527.59 MB
-  Heap In Use: 579.62 MB
-  GCs:         31
-  GC Pause:    0.14 ms
+  Heap Alloc:  725.39 MB
+  Heap In Use: 796.63 MB
+  GCs:         30
+  GC Pause:    0.25 ms
 
 Arrow Integration:
-  Avg Batch:     63776 rows (8443.31 KB)
+  Avg Batch:     62582 rows (8251.12 KB)
   Expansion:     8.00 columns
-  Denorm Fanout: 72.49 multiplier
+  Denorm Fanout: 72.50 multiplier
 
 Streaming:
-  Consumer Lag: 0 (Peak: 453)
-  Buffer Depth: 6391 (Peak: 15846)
+  Consumer Lag: 0 (Peak: 443)
+  Buffer Depth: 4851 (Peak: 15914)

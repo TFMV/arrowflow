@@ -101,7 +101,7 @@ func NewWireConsumer(s stream.Subscriber, cfg *config.Config, cc ConsumerConfig)
 
 	var ht *ba.HyperType
 	if cc.EnableHyper {
-		ht = ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))
+		ht = ba.NewHyperType(md, ba.WithAutoRecompile(0, 1.0))
 	}
 
 	opts := []ba.Option{

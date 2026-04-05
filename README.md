@@ -8,6 +8,7 @@ The repo now runs a real replicated STREAM benchmark path:
 - `Replicas=3`
 - explicit consumer ack after Arrow batch flush
 - worker-local transcoder isolation with a shared, concurrency-safe HyperType
+- corpus-first timed runs in `direct`, `stream`, and `stress` modes
 
 ## Quick Start
 
@@ -46,7 +47,7 @@ The suite restarts the cluster, runs the full STREAM matrix, and writes:
 
 ./bin/arrowflow experiment --mode direct --rate 10000 --duration 15s --workers 4 --batch-size 1000 --hyper=true
 
-./bin/arrowflow benchmark --messages 100000 --size 1024 --workers 8 --batch-size 1000 --hyper=true --denorm=true
+./bin/arrowflow benchmark --messages 100000 --size 1024 --workers 8 --batch-size 2000 --hyper=true --denorm=false
 
 ./bin/arrowflow chaos --rate 25000 --duration 20s --mode burst --workers 8 --hyper=true
 ```
@@ -60,17 +61,18 @@ Important flags:
 
 ## Current Result Snapshot
 
-These numbers come from the latest `scripts/run-all-experiments.sh` run on April 5, 2026, plus one direct corpus benchmark pass with the same corrected harness.
+These numbers come from the latest `scripts/run-all-experiments.sh` run on April 5, 2026, plus direct replay sweeps using the same corpus-first harness.
 
-- The direct `bufarrowlib` path is not the bottleneck in this repo anymore. `./bin/arrowflow benchmark --messages 100000 --size 1024 --workers 8 --batch-size 1000 --hyper=true --denorm=true` reached `91417.93 msg/s` and `237.73 MB/s`.
-- A heavy-tail direct run sustained `49999.20 msg/s` for `10s`, with `35.8 us` mean consume latency and `6.4 us` mean batch-output latency.
-- The replicated STREAM path plateaus much lower, which is the point of the harness: the best saturation result was `4680.39 msg/s` at `150000 msg/s` offered load, and `200000 msg/s` was essentially flat at `4661.59 msg/s`.
-- HyperType still materially lowers consume latency: `2.71x` on `small`, `2.49x` on `medium`, `1.39x` on `large`, and `1.90x` on `heavy-tail`.
-- Throughput gains from HyperType are no longer monotonic in STREAM mode. Once the run is broker-bound, lower consume latency does not always translate into higher end-to-end throughput.
-- The best heavy-tail STREAM batch size in this run was `500`: `4838.98 msg/s` with `35.8 us` mean consume latency. `batch=5000` and `batch=10000` pushed heap above `1.9 GB` and `2.1 GB`.
-- Denormalized output still wins on this schema despite real fanout: `4639.97 msg/s` vs `4492.68 msg/s`, with `36.2 us` vs `46.1 us` mean consume latency and `71.79x` average row fanout.
-- Worker scaling now shows the broker fetch path more clearly: `2 workers` reached `2540.71 msg/s`, `8 workers` reached `4247.79 msg/s`, and `16 workers` reached `4692.71 msg/s`.
-- Chaos mode consumed `87418` messages over `20s`, with `34.6 us` mean consume latency, `1.79 ms` mean produce latency, peak consumer lag `108`, and peak buffer depth `7875`.
+- All timed modes now prebuild a bounded raw-wire corpus before the clock starts. `stream` mode replays that corpus through JetStream instead of generating payloads on the publish path.
+- The direct `bufarrowlib` replay path is comfortably above `100k msg/s`. The best nested replay run on the fixed `100000`-message, `1024`-byte corpus reached `182999.32 msg/s` and `476.36 MB/s` with `8` workers and `batch=2000`.
+- The direct denormalized replay path also crossed the line: `113801.76 msg/s` and `296.62 MB/s` on the same corpus with `batch=2000`.
+- A rate-limited heavy-tail direct run still sustained `50000.70 msg/s` for `10s`, at `445.96 MB/s`.
+- The replicated STREAM path remains the visible ceiling. The best saturation point in the latest suite was `5889.87 msg/s` at `200000 msg/s` offered load.
+- HyperType still reduces consumer-side latency, but the broker path dominates end-to-end throughput in STREAM mode. The latency speedups were `1.43x` on `small`, `1.61x` on `medium`, `1.52x` on `large`, and `1.53x` on `heavy-tail`.
+- The best heavy-tail STREAM batch size in this run was `100`: `5419.90 msg/s` with `45.2 us` mean consume latency. `batch=5000` and `batch=10000` pushed heap to `1.67 GB` and `2.43 GB`.
+- Nested output won the replicated STREAM throughput comparison in this run: `5189.99 msg/s` vs `4803.75 msg/s`. Denorm still kept lower consume latency (`47.9 us` vs `52.2 us`) while averaging `72.36x` row fanout.
+- Worker scaling peaked before `16` workers: `2 workers` reached `3047.43 msg/s`, `8 workers` reached `4806.68 msg/s`, and `16 workers` slipped to `4590.07 msg/s`.
+- Chaos mode consumed `89893` messages over `20s`, with `48.2 us` mean consume latency, `1.74 ms` mean produce latency, peak consumer lag `298`, and peak buffer depth `7821`.
 
 ## What Was Fixed
 
@@ -78,10 +80,11 @@ The harness and pipeline now avoid the main integrity failures from the earlier 
 - JetStream messages are acked only after successful Arrow batch flush.
 - Consumer transcoders are released exactly once.
 - Subcommand flag parsing is isolated and correct.
-- Direct benchmarks now use prebuilt raw-message corpora, explicit HyperType warmup/recompile, flush batches, and terminate cleanly.
+- All timed modes now use prebuilt raw-message corpora, explicit HyperType warmup/recompile, flush batches, and terminate cleanly.
 - STREAM runs use real repeated-field denorm paths.
 - STREAM runs use all requested producer workers, support `--rate 0` max-throughput mode, and consume via parallel JetStream pull workers instead of a single callback funnel.
 - Replicated JetStream is explicit instead of silently falling back to plain publish.
+- Observability overhead was moved out of the per-message hot path so replay benchmarks measure the pipeline instead of Prometheus bookkeeping.
 - Per-run result extraction is based on final command output, not fragile intermediate telemetry files.
 
 ## Notes
