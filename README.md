@@ -8,8 +8,8 @@ A scientific evaluation harness for measuring `bufarrowlib` under realistic stre
 # Build all binaries
 make build
 
-# Start NATS server with JetStream enabled
-docker run -d -p 4222:4222 --name nats nats:latest -js
+# Start 3-node NATS cluster with JetStream and clustering enabled
+docker-compose up -d
 
 # Run the full automated evaluation suite
 ./scripts/run-all-experiments.sh
@@ -149,3 +149,8 @@ Ensure you are using `--mode stream` if testing with the NATS broker. For intern
 
 ### High GC overhead
 Increase `--batch-size` or enable `--hyper=true` to reduce allocation frequency.
+
+### Cluster Connectivity
+ArrowFlow supports multiple NATS URLs for robust cluster testing. Provide a comma-separated list in the `NATS_URL` environment variable:
+`NATS_URL="nats://node1:4222,nats://node2:4222"`.
+The suite implements infinite reconnection and seed-list randomization by default.

@@ -19,13 +19,32 @@ func NewConsumer(cfg *config.Config) (Subscriber, error) {
 	return NewNATSConsumer(cfg)
 }
 
+func connectNATS(cfg *config.Config, name string) (*nats.Conn, error) {
+	opts := []nats.Option{
+		nats.Name(name),
+		nats.MaxReconnects(-1),            // Infinite reconnects for stability
+		nats.ReconnectWait(2 * time.Second), // Wait 2s between attempts
+		nats.RetryOnFailedConnect(true),   // Wait for NATS to be available
+		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
+			if err != nil {
+				log.Printf("NATS disconnected (%s): %v", name, err)
+			}
+		}),
+		nats.ReconnectHandler(func(nc *nats.Conn) {
+			log.Printf("NATS reconnected (%s) to %v", name, nc.ConnectedUrl())
+		}),
+	}
+
+	return nats.Connect(cfg.NATSURL, opts...)
+}
+
 type natsProducer struct {
 	conn *nats.Conn
 	js   jetstream.JetStream
 }
 
 func NewNATSProducer(cfg *config.Config) (Publisher, error) {
-	nc, err := nats.Connect(cfg.NATSURL)
+	nc, err := connectNATS(cfg, "ArrowFlow Producer")
 	if err != nil {
 		return nil, err
 	}
@@ -96,7 +115,7 @@ type natsConsumer struct {
 }
 
 func NewNATSConsumer(cfg *config.Config) (Subscriber, error) {
-	nc, err := nats.Connect(cfg.NATSURL)
+	nc, err := connectNATS(cfg, "ArrowFlow Consumer")
 	if err != nil {
 		return nil, err
 	}

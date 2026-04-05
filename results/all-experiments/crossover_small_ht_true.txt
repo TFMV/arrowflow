@@ -1,30 +1,31 @@
 [DEBUG] mode=stream, rate=20000, workers=8, duration=15s, hyper=true
-2026/04/04 16:08:00 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
-2026/04/04 16:08:00 Experiment: mode=stream, rate=20000, workers=8, duration=15s
-2026/04/04 16:08:00 Running Stream Experiment (NATS): rate=20000, duration=15s, workers=8, batch=1000, dist=small, denorm=true
-2026/04/04 16:08:00 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
+2026/04/04 18:39:34 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
+2026/04/04 18:39:34 Experiment: mode=stream, rate=20000, workers=8, duration=15s
+2026/04/04 18:39:34 Running Stream Experiment (NATS): rate=20000, duration=15s, workers=8, batch=1000, dist=small, denorm=true
+2026/04/04 18:39:34 Created NATS stream: ARROWFLOW with subject: arrowflow.test
+2026/04/04 18:39:34 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
 Experiment Results (NATS):
   Mode: stream
-  Duration: 17.001170875s
-  Messages: 73772
-  Rate: 4339.23 msg/s
+  Duration: 17.0006305s
+  Messages: 52587
+  Rate: 3093.24 msg/s
 === ArrowFlow Telemetry Report ===
-Timestamp: 2026-04-04T16:08:17-05:00
+Timestamp: 2026-04-04T18:39:51-05:00
 
 Throughput:
-  Messages/sec: 4332.23
-  Bytes/sec:    7.63 MB/s
-  Total:        73772 messages, 129.91 MB
+  Messages/sec: 3087.14
+  Bytes/sec:    5.43 MB/s
+  Total:        52587 messages, 92.47 MB
 
 Latency (ns):
-  Produce:      mean=133700, p50=126208, p95=159083, p99=190000, p99.9=360416
-  Consume:      mean=2913, p50=2208, p95=3708, p99=10333, p99.9=61125
-  Batch Output: mean=12384, p50=5375, p95=13667, p99=387083, p99.9=387083
+  Produce:      mean=211293, p50=187583, p95=269542, p99=410500, p99.9=844292
+  Consume:      mean=4400, p50=2542, p95=12834, p99=26625, p99.9=66417
+  Batch Output: mean=15792, p50=5791, p95=15417, p99=459083, p99.9=459083
 
 Memory:
-  Heap Alloc:  9.90 MB
-  Heap In Use: 12.20 MB
-  GCs:         700
+  Heap Alloc:  8.74 MB
+  Heap In Use: 10.94 MB
+  GCs:         502
   GC Pause:    0.03 ms
 
 Arrow Integration:
@@ -34,4 +35,4 @@ Arrow Integration:
 
 Streaming:
   Consumer Lag: 0 (Peak: 0)
-  Buffer Depth: 0 (Peak: 5)
+  Buffer Depth: 0 (Peak: 4)
