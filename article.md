@@ -1,8 +1,8 @@
 # I Finally Got a Clean Protobuf → Arrow Pipeline—Then the Bottleneck Moved
 
-A friend of mine built something that forced me to rethink a chunk of ingestion code I had quietly accepted as inevitable.
+A friend of mine built something that forced me to rethink a chunk of ingestion code I had accepted as inevitable.
 
-It’s called `[bufarrowlib](https://github.com/loicalleyne/bufarrowlib)`. The idea is almost suspiciously clean: take raw Protobuf wire bytes, point the library at a descriptor, and emit Apache Arrow RecordBatches directly—no generated Go structs, no hand-written `RecordBuilder` glue, no second pass.
+It’s called [bufarrowlib](https://github.com/loicalleyne/bufarrowlib). The idea is almost suspiciously clean: take raw Protobuf wire bytes, point the library at a descriptor, and emit Apache Arrow RecordBatches directly—no generated Go structs, no hand-written `RecordBuilder` glue, no second pass.
 
 If you’ve built enough pipelines, that pitch lands right in the scar tissue.
 
