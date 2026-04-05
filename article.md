@@ -1,4 +1,4 @@
-# I Tried to Break bufarrowlib. It Broke My Mental Model Instead.
+# When Protobuf Meets Arrow at Scale: The Bottleneck Isn’t Where You Think
 
 A couple days ago, a friend of mine shipped something that solved a problem I'd been complaining about for years. It's called **[bufarrowlib](https://github.com/loicalleyne/bufarrowlib)** — a Go library that converts raw Protobuf wire bytes directly into Apache Arrow RecordBatches, no intermediate structs, no codegen.
 
