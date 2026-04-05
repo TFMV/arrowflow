@@ -65,6 +65,21 @@ type WireProducer struct {
 	cancel context.CancelFunc
 }
 
+type CorpusOptions struct {
+	TargetMessages int
+	FixedSize      int
+	PilotMessages  int
+	MaxMessages    int
+	MaxBytes       int64
+}
+
+type RawCorpus struct {
+	Messages        [][]byte
+	DesiredMessages int
+	TotalBytes      int64
+	AvgBytes        int64
+}
+
 type WireConfig struct {
 	Mode          string
 	Rate          int
@@ -358,6 +373,80 @@ func BuildRawCorpus(wc WireConfig, count, fixedSize int) ([][]byte, error) {
 		corpus = append(corpus, raw)
 	}
 	return corpus, nil
+}
+
+func PrepareRawCorpus(wc WireConfig, opts CorpusOptions) (*RawCorpus, error) {
+	desired := opts.TargetMessages
+	if desired <= 0 {
+		desired = 1
+	}
+
+	pilotCount := opts.PilotMessages
+	if pilotCount <= 0 {
+		pilotCount = 1024
+	}
+	if pilotCount > desired {
+		pilotCount = desired
+	}
+
+	pilot, err := BuildRawCorpus(wc, pilotCount, opts.FixedSize)
+	if err != nil {
+		return nil, err
+	}
+
+	totalBytes := corpusBytes(pilot)
+	avgBytes := int64(0)
+	if len(pilot) > 0 {
+		avgBytes = totalBytes / int64(len(pilot))
+	}
+	if avgBytes <= 0 {
+		avgBytes = 1
+	}
+
+	planned := desired
+	if opts.MaxMessages > 0 && planned > opts.MaxMessages {
+		planned = opts.MaxMessages
+	}
+	if opts.MaxBytes > 0 {
+		maxByBytes := int(opts.MaxBytes / avgBytes)
+		if maxByBytes <= 0 {
+			maxByBytes = 1
+		}
+		if planned > maxByBytes {
+			planned = maxByBytes
+		}
+	}
+
+	if planned < len(pilot) {
+		pilot = pilot[:planned]
+		totalBytes = corpusBytes(pilot)
+	} else if planned > len(pilot) {
+		extra, err := BuildRawCorpus(wc, planned-len(pilot), opts.FixedSize)
+		if err != nil {
+			return nil, err
+		}
+		pilot = append(pilot, extra...)
+		totalBytes += corpusBytes(extra)
+	}
+
+	if len(pilot) > 0 {
+		avgBytes = totalBytes / int64(len(pilot))
+	}
+
+	return &RawCorpus{
+		Messages:        pilot,
+		DesiredMessages: desired,
+		TotalBytes:      totalBytes,
+		AvgBytes:        avgBytes,
+	}, nil
+}
+
+func corpusBytes(corpus [][]byte) int64 {
+	var total int64
+	for _, raw := range corpus {
+		total += int64(len(raw))
+	}
+	return total
 }
 
 var stressConfig = StressConfig{

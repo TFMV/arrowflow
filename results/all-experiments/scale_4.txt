@@ -1,36 +1,37 @@
-2026/04/05 00:20:53 Worker 1: processed 13 batches
-2026/04/05 00:20:53 Worker 3: processed 13 batches
-2026/04/05 00:20:53 Worker 0: processed 13 batches
-2026/04/05 00:20:53 Worker 2: processed 13 batches
+2026/04/05 08:13:13 Prepared corpus for stream: 27596 messages replayable (750000 desired, 242.30 MB total, avg 9206 bytes)
+2026/04/05 08:13:44 Worker 1: processed 16 batches
+2026/04/05 08:13:44 Worker 2: processed 16 batches
+2026/04/05 08:13:44 Worker 0: processed 16 batches
+2026/04/05 08:13:44 Worker 3: processed 15 batches
 Experiment Results:
   Mode: stream
-  Duration: 15.000014917s
-  Messages: 48743
-  Rate: 3249.53 msg/s
+  Duration: 15.00000325s
+  Messages: 59959
+  Rate: 3997.27 msg/s
 === ArrowFlow Telemetry Report ===
-Timestamp: 2026-04-05T00:20:53-05:00
+Timestamp: 2026-04-05T08:13:44-05:00
 
 Throughput:
-  Messages/sec: 1615.91
-  Bytes/sec:    15.26 MB/s
-  Total:        48743 messages, 460.20 MB
+  Messages/sec: 1987.04
+  Bytes/sec:    17.46 MB/s
+  Total:        59959 messages, 526.78 MB
 
 Latency (ns):
-  Produce:      mean=1229596, p50=927250, p95=2885167, p99=9417584, p99.9=42007625
-  Consume:      mean=38202, p50=28042, p95=101709, p99=174000, p99.9=470208
-  Batch Output: mean=11494, p50=9541, p95=31083, p99=68292, p99.9=68292
+  Produce:      mean=1000185, p50=701833, p95=1943834, p99=6584208, p99.9=25849875
+  Consume:      mean=45461, p50=33625, p95=110375, p99=185083, p99.9=445458
+  Batch Output: mean=10985, p50=6709, p95=9500, p99=9500, p99.9=9500
 
 Memory:
-  Heap Alloc:  206.36 MB
-  Heap In Use: 224.09 MB
-  GCs:         42
-  GC Pause:    0.40 ms
+  Heap Alloc:  459.59 MB
+  Heap In Use: 488.10 MB
+  GCs:         35
+  GC Pause:    0.04 ms
 
 Arrow Integration:
-  Avg Batch:     70110 rows (9249.61 KB)
+  Avg Batch:     68796 rows (9090.18 KB)
   Expansion:     8.00 columns
-  Denorm Fanout: 74.86 multiplier
+  Denorm Fanout: 73.16 multiplier
 
 Streaming:
-  Consumer Lag: 0 (Peak: 197)
-  Buffer Depth: 743 (Peak: 3957)
+  Consumer Lag: 0 (Peak: 183)
+  Buffer Depth: 959 (Peak: 3891)
