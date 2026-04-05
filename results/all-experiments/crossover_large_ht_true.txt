@@ -1,31 +1,31 @@
 [DEBUG] mode=stream, rate=20000, workers=8, duration=15s, hyper=true
-2026/04/04 16:09:08 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
-2026/04/04 16:09:08 Experiment: mode=stream, rate=20000, workers=8, duration=15s
-2026/04/04 16:09:08 Running Stream Experiment (NATS): rate=20000, duration=15s, workers=8, batch=1000, dist=large, denorm=true
-2026/04/04 16:09:08 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
+2026/04/04 18:40:42 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
+2026/04/04 18:40:42 Experiment: mode=stream, rate=20000, workers=8, duration=15s
+2026/04/04 18:40:42 Running Stream Experiment (NATS): rate=20000, duration=15s, workers=8, batch=1000, dist=large, denorm=true
+2026/04/04 18:40:42 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
 Experiment Results (NATS):
   Mode: stream
-  Duration: 17.007832042s
-  Messages: 8647
-  Rate: 508.41 msg/s
+  Duration: 17.001361458s
+  Messages: 8262
+  Rate: 485.96 msg/s
 === ArrowFlow Telemetry Report ===
-Timestamp: 2026-04-04T16:09:25-05:00
+Timestamp: 2026-04-04T18:40:59-05:00
 
 Throughput:
-  Messages/sec: 508.09
-  Bytes/sec:    18.30 MB/s
-  Total:        8647 messages, 311.43 MB
+  Messages/sec: 485.57
+  Bytes/sec:    17.62 MB/s
+  Total:        8262 messages, 299.85 MB
 
 Latency (ns):
-  Produce:      mean=608523, p50=541333, p95=1061416, p99=1676375, p99.9=6057750
-  Consume:      mean=10691, p50=7041, p95=24417, p99=80375, p99.9=263708
-  Batch Output: mean=9333, p50=7708, p95=20875, p99=20875, p99.9=20875
+  Produce:      mean=628250, p50=504417, p95=1659875, p99=2329833, p99.9=4541000
+  Consume:      mean=12310, p50=7833, p95=27834, p99=91625, p99.9=246333
+  Batch Output: mean=8630, p50=7959, p95=16541, p99=16541, p99.9=16541
 
 Memory:
-  Heap Alloc:  6.56 MB
-  Heap In Use: 8.41 MB
-  GCs:         1236
-  GC Pause:    0.02 ms
+  Heap Alloc:  7.71 MB
+  Heap In Use: 9.58 MB
+  GCs:         1145
+  GC Pause:    0.04 ms
 
 Arrow Integration:
   Avg Batch:     1000 rows (0.00 KB)
