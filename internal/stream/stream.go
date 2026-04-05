@@ -22,9 +22,10 @@ func NewConsumer(cfg *config.Config) (Subscriber, error) {
 func connectNATS(cfg *config.Config, name string) (*nats.Conn, error) {
 	opts := []nats.Option{
 		nats.Name(name),
-		nats.MaxReconnects(-1),            // Infinite reconnects for stability
-		nats.ReconnectWait(2 * time.Second), // Wait 2s between attempts
-		nats.RetryOnFailedConnect(true),   // Wait for NATS to be available
+		nats.MaxReconnects(-1),
+		nats.ReconnectWait(2 * time.Second),
+		nats.RetryOnFailedConnect(true),
+		nats.Timeout(5 * time.Second),
 		nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
 			if err != nil {
 				log.Printf("NATS disconnected (%s): %v", name, err)
@@ -51,56 +52,27 @@ func NewNATSProducer(cfg *config.Config) (Publisher, error) {
 
 	js, err := jetstream.New(nc)
 	if err != nil {
-		log.Printf("Warning: JetStream not available: %v", err)
-		// Try without JetStream - will use direct publish
-		return &natsProducer{conn: nc, js: nil}, nil
+		nc.Close()
+		return nil, err
 	}
 
-	// Try to create stream if it doesn't exist
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	streamName := "ARROWFLOW"
-	topic := cfg.Topic
-
-	// Check if stream exists
-	if _, err := js.Stream(ctx, streamName); err != nil {
-		// Stream doesn't exist, create it
-		_, err = js.CreateStream(ctx, jetstream.StreamConfig{
-			Name:      streamName,
-			Subjects:  []string{topic},
-			Retention: jetstream.LimitsPolicy,
-			Storage:   jetstream.MemoryStorage,
-			MaxBytes:  1024 * 1024 * 100, // 100MB
-		})
-		if err != nil {
-			log.Printf("Warning: could not create NATS stream: %v", err)
-			// Continue without JetStream - will use direct publish
-			return &natsProducer{conn: nc, js: nil}, nil
-		}
-		log.Printf("Created NATS stream: %s with subject: %s", streamName, topic)
+	if err := ensureStream(ctx, js, cfg); err != nil {
+		nc.Close()
+		return nil, err
 	}
 
 	return &natsProducer{conn: nc, js: js}, nil
 }
 
 func (p *natsProducer) Publish(ctx context.Context, topic string, msg *Msg) error {
-	// Try JetStream first, fall back to direct publish
-	if p.js != nil {
-		_, err := p.js.Publish(ctx, topic, msg.Payload)
-		if err == nil {
-			return nil
-		}
-		// If JetStream fails, try direct publish
-		log.Printf("JetStream publish failed: %v, trying direct publish", err)
+	if p.js == nil {
+		return nats.ErrNoServers
 	}
-
-	// Fallback: direct nats publish (no JetStream)
-	if p.conn != nil {
-		return p.conn.Publish(topic, msg.Payload)
-	}
-
-	return nil
+	_, err := p.js.Publish(ctx, topic, msg.Payload)
+	return err
 }
 
 func (p *natsProducer) Close() error {
@@ -130,74 +102,111 @@ func NewNATSConsumer(cfg *config.Config) (Subscriber, error) {
 }
 
 func (c *natsConsumer) Consume(ctx context.Context, topic string, handler func(msg *Msg) error) error {
-	streamName := "ARROWFLOW"
-	stream, err := c.js.Stream(ctx, streamName)
-	if err != nil {
-		// Fallback: try to create it if it doesn't exist
-		stream, err = c.js.CreateStream(ctx, jetstream.StreamConfig{
-			Name:     streamName,
-			Subjects: []string{c.conf.Topic},
-		})
-		if err != nil {
-			return err
-		}
+	if err := ensureStream(ctx, c.js, c.conf); err != nil {
+		return err
 	}
 
-	cons, err := stream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:   c.conf.ConsumerGroup,
-		AckPolicy: jetstream.AckExplicitPolicy,
-	})
+	stream, err := c.js.Stream(ctx, c.conf.StreamName)
 	if err != nil {
 		return err
 	}
 
-	// Start metrics polling
-	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
+	consumerCfg := jetstream.ConsumerConfig{
+		Durable:       c.conf.ConsumerGroup,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		AckWait:       c.conf.ConsumerAckWait,
+		MaxAckPending: c.conf.ConsumerMaxAckPending,
+		FilterSubject: topic,
+	}
+	if c.conf.ConsumerStartAtNew {
+		consumerCfg.DeliverPolicy = jetstream.DeliverNewPolicy
+	}
 
-		// Initial check
-		if status, err := cons.Info(ctx); err == nil {
-			metrics.SetConsumerLag(int64(status.NumPending))
-			metrics.SetBufferDepth(int64(status.NumAckPending))
+	cons, err := stream.CreateOrUpdateConsumer(ctx, consumerCfg)
+	if err != nil {
+		return err
+	}
+
+	go pollConsumerMetrics(ctx, cons)
+
+	iter, err := cons.Consume(func(jsMsg jetstream.Msg) {
+		headers := make(map[string][]byte, len(jsMsg.Headers()))
+		for key, values := range jsMsg.Headers() {
+			if len(values) == 0 {
+				continue
+			}
+			headers[key] = []byte(values[0])
 		}
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				status, err := cons.Info(ctx)
-				if err == nil {
-					metrics.SetConsumerLag(int64(status.NumPending))
-					metrics.SetBufferDepth(int64(status.NumAckPending))
-				}
+		msg := &Msg{
+			Payload:   append([]byte(nil), jsMsg.Data()...),
+			Subject:   jsMsg.Subject(),
+			Timestamp: time.Now().UnixNano(),
+			Headers:   headers,
+			ackFn:     jsMsg.Ack,
+			nakFn:     jsMsg.Nak,
+			termFn:    jsMsg.Term,
+		}
+
+		if err := handler(msg); err != nil && !msg.Settled() {
+			if nakErr := msg.Nak(); nakErr != nil {
+				log.Printf("NATS negative ack failed: %v", nakErr)
 			}
 		}
-	}()
-
-	iter, err := cons.Consume(func(msg jetstream.Msg) {
-		m := &Msg{
-			Payload:   msg.Data(),
-			Timestamp: time.Now().UnixNano(), // Use nanoseconds for consistency
-		}
-		if err := handler(m); err != nil {
-			msg.Term() // Serious error, stop retrying this message
-		} else {
-			msg.Ack()
-		}
 	})
 	if err != nil {
 		return err
 	}
 
-	// Wait for context cancellation
 	<-ctx.Done()
 	iter.Stop()
-	return ctx.Err()
+	return nil
 }
 
 func (c *natsConsumer) Close() error {
 	c.conn.Close()
 	return nil
+}
+
+func ensureStream(ctx context.Context, js jetstream.JetStream, cfg *config.Config) error {
+	_, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:      cfg.StreamName,
+		Subjects:  []string{cfg.Topic},
+		Retention: jetstream.WorkQueuePolicy,
+		Storage:   streamStorage(cfg),
+		Replicas:  cfg.StreamReplicas,
+		MaxBytes:  cfg.StreamMaxBytes,
+	})
+	return err
+}
+
+func pollConsumerMetrics(ctx context.Context, cons jetstream.Consumer) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	record := func() {
+		status, err := cons.Info(ctx)
+		if err != nil {
+			return
+		}
+		metrics.SetConsumerLag(int64(status.NumPending))
+		metrics.SetBufferDepth(int64(status.NumAckPending))
+	}
+
+	record()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			record()
+		}
+	}
+}
+
+func streamStorage(cfg *config.Config) jetstream.StorageType {
+	if cfg.StreamStorage == "memory" {
+		return jetstream.MemoryStorage
+	}
+	return jetstream.FileStorage
 }

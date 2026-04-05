@@ -1,156 +1,85 @@
-# ArrowFlow: Streaming Protobuf → Arrow Pipeline
+# ArrowFlow
 
-A scientific evaluation harness for measuring `bufarrowlib` under realistic streaming pressure. Designed to identify **phase transitions**, **crossover points**, and **stability boundaries** in the ingestion pipeline.
+ArrowFlow is a Go evaluation harness for a streaming Protobuf -> Apache Arrow pipeline built around `bufarrowlib`, NATS JetStream, and an optional HyperType JIT decode path.
+
+The repo now runs a real replicated STREAM benchmark path:
+- 3-node JetStream cluster
+- file-backed streams
+- `Replicas=3`
+- explicit consumer ack after Arrow batch flush
+- per-worker transcoder isolation
 
 ## Quick Start
 
 ```bash
-# Build all binaries
 make build
 
-# Start 3-node NATS cluster with JetStream and clustering enabled
-docker-compose up -d
+docker compose up -d
 
-# Run the full automated evaluation suite
+export NATS_URL="nats://127.0.0.1:4222,nats://127.0.0.1:4223,nats://127.0.0.1:4224"
+export STREAM_REPLICAS=3
+export STREAM_STORAGE=file
+
 ./scripts/run-all-experiments.sh
 ```
 
-## Architecture Overview
+The suite restarts the cluster, runs the full STREAM matrix, and writes:
+- `results/all-experiments/results.csv`
+- `results/all-experiments/*.txt`
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           ARROWFLOW PIPELINE                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Producer                Broker              Consumer           Arrow       │
-│  ───────                ──────              ────────           ──────       │
-│                                                                             │
-│  ┌─────────┐      ┌─────────────┐      ┌─────────────┐    ┌─────────────┐   │
-│  │ Wire    │─────▶│  NATS/      │─────▶│ bufarrowlib │───▶│ RecordBatch │   │
-│  │ Bytes   │      │  Kafka      │      │ Decoder     │    │ Output      │   │
-│  └─────────┘      └─────────────┘      └─────────────┘    └─────────────┘   │
-│       │                                      │                              │
-│       ▼                                      ▼                              │
-│  ┌─────────┐                        ┌─────────────┐                         │
-│  │ Chaos   │                        │ HyperType   │                         │
-│  │ Injector│                        │ (optional)  │                         │
-│  └─────────┘                        └─────────────┘                         │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+## Cluster Layout
 
-## CLI Usage
+`docker-compose.yaml` starts:
+- `nats-1` on `4222`, monitor `8222`
+- `nats-2` on `4223`, monitor `8223`
+- `nats-3` on `4224`, monitor `8224`
+- `nats-box` for CLI inspection inside the Docker network
 
-ArrowFlow provides several specialized subcommands for performance characterization:
+`nats.conf` enables JetStream, file storage under `/data/jetstream`, HTTP monitoring, and cluster routing on `6222`.
+
+## Commands
 
 ```bash
-# Experiment - multi-dimensional scientific analysis
-./bin/arrowflow experiment \
-  --mode stream \
-  --rate 50000 \
-  --duration 20s \
-  --batch-size 1000 \
-  --size-dist heavy-tail \
-  --denorm=true \
-  --hyper=true
+./bin/arrowflow experiment --mode stream --rate 50000 --duration 15s --workers 8 --batch-size 1000 --hyper=true --denorm=true
 
-# Chaos - failure and skew injection
-./bin/arrowflow chaos \
-  --rate 10000 \
-  --duration 1m \
-  --chaos-burst \
-  --chaos-schema \
-  --chaos-hot-partition \
-  --chaos-size-shock
+./bin/arrowflow experiment --mode direct --rate 10000 --duration 15s --workers 4 --batch-size 1000 --hyper=true
+
+./bin/arrowflow chaos --rate 25000 --duration 20s --mode burst --workers 8 --hyper=true
 ```
 
-### Key Flags:
-| Flag | Description | Values |
-| :--- | :--- | :--- |
-| `--mode` | Execution mode | `stream` (NATS), `direct` (In-process) |
-| `--size-dist` | Message size profile | `small`, `medium`, `large`, `heavy-tail` |
-| `--denorm` | Structural mode | `true` (Flat Arrow), `false` (Nested Arrow) |
-| `--batch-size` | Buffering threshold | Rows before Arrow emission (e.g., 100, 1000, 10000) |
-| `--hyper` | Enable HyperType | JIT-compiled Protobuf decoding |
+Important flags:
+- `--mode`: `stream`, `direct`, `stress`
+- `--size-dist`: `small`, `medium`, `large`, `heavy-tail`
+- `--denorm`: flattened Arrow output with repeated-field fanout
+- `--batch-size`: Arrow flush threshold per worker
+- `--hyper`: enable HyperType JIT parsing
 
----
+## Current Result Snapshot
 
-# SCIENTIFIC EVALUATION
+These numbers come from the latest `scripts/run-all-experiments.sh` run on April 4, 2026 against the replicated STREAM path.
 
-ArrowFlow is built to answer six fundamental questions about the ingestion pipeline. These are automated in the `./scripts/run-all-experiments.sh` suite.
+- HyperType reduced mean consume latency by `2.95x` on `small`, `1.95x` on `medium`, `1.52x` on `large`, and `2.02x` on `heavy-tail`.
+- Best batch-size balance in this environment was `1000`: `2402.62 msg/s` at `36.5 us` mean consume latency.
+- `batch=10000` did not improve throughput and drove heap usage to `1477.80 MB` with `32986` messages buffered.
+- Denormalized output outperformed nested output in this schema: `2932.68 msg/s` vs `1998.80 msg/s`, with mean consume latency `32.3 us` vs `52.8 us`.
+- Denorm fanout was real, not synthetic: about `72x` on heavy-tail workloads and about `110x` on large workloads.
+- Peak observed STREAM throughput was `5404.24 msg/s` at `200000 msg/s` offered load.
+- Worker scaling was not linear. In this single-host cluster run, `2 workers` and `16 workers` were similar on throughput, while `8 workers` regressed on latency and throughput.
+- Chaos mode consumed `28892` messages over `20s`, with peak buffer depth `7817` and no sustained consumer lag.
 
-## The 6-Phase Evaluation Suite
+## What Was Fixed
 
-### Phase 1: HyperType Crossover Point
-**Goal**: Identify where HyperType's JIT overhead outweighs its benefits.
-- **Method**: Compares baseline vs HyperType across `small`, `medium`, `large`, and `heavy-tail` distributions.
-- **Outcome**: Documents the payload size crossover where JIT parsing becomes 4x+ faster than standard decoding.
+The harness and pipeline now avoid the main integrity failures from the earlier audit:
+- JetStream messages are acked only after successful Arrow batch flush.
+- Consumer transcoders are released exactly once.
+- Subcommand flag parsing is isolated and correct.
+- Direct benchmarks flush batches and terminate cleanly.
+- STREAM runs use real repeated-field denorm paths.
+- Replicated JetStream is explicit instead of silently falling back to plain publish.
+- Per-run result extraction is based on final command output, not fragile intermediate telemetry files.
 
-### Phase 2: Batch Size & GC Optimization
-**Goal**: Find the "sweet spot" for row buffering.
-- **Method**: Sweeps batch sizes from 100 to 10,000 rows.
-- **Metric**: Monitors `GC Count` vs `Consumption Latency`.
+## Notes
 
-### Phase 3: Structural Cost (Denorm vs Nested)
-**Goal**: Quantify the cost of flat Arrow denormalization.
-- **Method**: Compares `denorm=true` vs `denorm=false` at high rates.
-- **Metric**: Uses `Expansion Factor` and `Fan-out Multiplier` to measure row inflation.
-
-### Phase 4: Throughput Saturation (Finding the Plateau)
-**Goal**: Identify the hardware/environment bottleneck.
-- **Method**: Rate sweep from 10,000 to 200,000 msg/s.
-- **Metric**: Finds where `Observed Rate` plateaus and `Consumer Lag` spikes.
-
-### Phase 5: Worker Scaling Efficiency
-**Goal**: Measure parallelism scaling limits.
-- **Method**: Scales processing workers from 2 to 16.
-
-### Phase 6: Chaos & Stability Boundary
-**Goal**: Test system recovery under adverse conditions.
-- **Method**: Sustained 1-minute run with bursts, schema evolution, and partition skew enabled.
-
----
-
-## Interpreting Telemetry
-
-Hardened telemetry provides three new specialized sections for scientific analysis:
-
-### 1. Arrow Integration Metrics
-Found in the `Arrow Integration` section of the report and `results.csv`:
-- **Expansion**: Measures column complexity (cols/row).
-- **Denorm Fan-out**: The ratio of input messages to output rows (multi-row expansion).
-- **Avg Batch**: Actual rows and KB per emitted RecordBatch.
-
-### 2. Streaming Performance
-- **Consumer Lag**: Messages pending in the broker.
-- **Buffer Depth**: Messages pending in the internal transcoder buffer.
-- **Peak Metrics**: Evaluates stability boundaries by tracking the highest recorded lag/depth.
-
-### 3. Latency Characterization
-Standardized to **nanoseconds (ns)** across all reports:
-- **Produce**: Network/Broker entry latency.
-- **Consume**: Ingestion and Transcoding latency.
-- **Batch Output**: Arrow record serialization and emission time.
-
-## Evaluation Results
-All results are automatically aggregated into:
-- `results/all-experiments/results.csv`: A machine-readable matrix of all phases.
-- `results/all-experiments/*.txt`: Human-readable summaries for individual trials.
-
----
-
-## Troubleshooting
-
-### "nats: no response from stream"
-Ensure NATS is started with `-js` (JetStream enabled).
-
-### Metrics show 0 for consumption
-Ensure you are using `--mode stream` if testing with the NATS broker. For internal stress tests, use `--mode direct`.
-
-### High GC overhead
-Increase `--batch-size` or enable `--hyper=true` to reduce allocation frequency.
-
-### Cluster Connectivity
-ArrowFlow supports multiple NATS URLs for robust cluster testing. Provide a comma-separated list in the `NATS_URL` environment variable:
-`NATS_URL="nats://node1:4222,nats://node2:4222"`.
-The suite implements infinite reconnection and seed-list randomization by default.
+- This is still a single-host benchmark harness. The broker path is truly replicated JetStream, but all three nodes run on one machine, so network and disk findings should be interpreted as single-host cluster behavior.
+- `bufarrowlib` transcoders and HyperType contexts are still per-worker resources. Do not share them across goroutines.
+- Arrow record batches must always be released.

@@ -21,6 +21,10 @@ import (
 	"time"
 )
 
+type workItem struct {
+	msg *stream.Msg
+}
+
 type OutputMode int
 
 const (
@@ -49,7 +53,7 @@ type WireConsumer struct {
 		batches  atomic.Int64
 	}
 
-	inputChan chan []byte
+	inputChan chan workItem
 	ctx       context.Context
 	cancel    context.CancelFunc
 }
@@ -74,8 +78,8 @@ var DefaultConsumerConfig = ConsumerConfig{
 		"session.session_id",
 		"tracing.trace_id",
 		"payload.event_type",
-		"enrichment.geo.country",
-		"enrichment.geo.city",
+		"metrics[*].name",
+		"tags[*].key",
 	},
 }
 
@@ -133,7 +137,7 @@ func NewWireConsumer(s stream.Subscriber, cfg *config.Config, cc ConsumerConfig)
 		enableHyper: cc.EnableHyper,
 		ht:          ht,
 		transcoders: transcoders,
-		inputChan:   make(chan []byte, cc.BatchSize*cc.Workers),
+		inputChan:   make(chan workItem, cc.BatchSize*cc.Workers),
 		ctx:         ctx,
 		cancel:      cancel,
 	}, nil
@@ -163,10 +167,7 @@ func (wc *WireConsumer) Run(ctx context.Context) error {
 		select {
 		case <-wc.ctx.Done():
 			return wc.ctx.Err()
-		default:
-			wc.inputChan <- msg.Payload
-			wc.stats.bytes.Add(int64(len(msg.Payload)))
-			wc.stats.messages.Add(1)
+		case wc.inputChan <- workItem{msg: msg}:
 			return nil
 		}
 	})
@@ -186,11 +187,13 @@ func (wc *WireConsumer) processWorker(workerID int) {
 	if tc == nil {
 		return
 	}
-	defer tc.Release()
 
 	var batchCount int
-	var msgCount int
-	for raw := range wc.inputChan {
+	var pending []*stream.Msg
+	var pendingBytes int64
+	for item := range wc.inputChan {
+		raw := item.msg.Payload
+		startConsume := time.Now()
 		var err error
 		switch wc.outputMode {
 		case OutputModeDenorm:
@@ -201,53 +204,70 @@ func (wc *WireConsumer) processWorker(workerID int) {
 
 		if err != nil {
 			wc.stats.errors.Add(1)
+			metrics.RecordError()
+			if termErr := item.msg.Term(); termErr != nil {
+				log.Printf("worker %d: terminate failed: %v", workerID, termErr)
+			}
 			continue
 		}
 
-		msgCount++
-		if msgCount >= wc.batchSize {
-			var rec arrow.RecordBatch
-			startBatch := time.Now()
-			switch wc.outputMode {
-			case OutputModeDenorm:
-				rec = tc.NewDenormalizerRecordBatch()
-			default:
-				rec = tc.NewRecordBatch()
-			}
-			metrics.RecordLatency("batch_output", startBatch)
-
-			if rec.NumRows() > 0 {
-				metrics.BytesConsumed.Add(float64(rec.NumRows() * rec.NumCols() * 100))
-				metrics.MessagesConsumed.Add(float64(rec.NumRows()))
-				wc.stats.rows.Add(rec.NumRows())
-				wc.stats.batches.Add(1)
+		metrics.RecordLatency("consume", startConsume)
+		pending = append(pending, item.msg)
+		pendingBytes += int64(len(raw))
+		if len(pending) >= wc.batchSize {
+			if wc.flushBatch(tc, pending, pendingBytes) {
 				batchCount++
 			}
-			rec.Release()
-			msgCount = 0
+			pending = pending[:0]
+			pendingBytes = 0
 		}
 	}
 
-	finalBatch := func() arrow.RecordBatch {
-		startFinalBatch := time.Now()
-		defer func() { metrics.RecordLatency("batch_output", startFinalBatch) }()
-		switch wc.outputMode {
-		case OutputModeDenorm:
-			return tc.NewDenormalizerRecordBatch()
-		default:
-			return tc.NewRecordBatch()
+	if len(pending) > 0 {
+		if wc.flushBatch(tc, pending, pendingBytes) {
+			batchCount++
 		}
-	}()
-
-	if finalBatch.NumRows() > 0 {
-		metrics.BytesConsumed.Add(float64(finalBatch.NumRows() * finalBatch.NumCols() * 100))
-		metrics.MessagesConsumed.Add(float64(finalBatch.NumRows()))
-		wc.stats.rows.Add(finalBatch.NumRows())
-		wc.stats.batches.Add(1)
 	}
-	finalBatch.Release()
 
 	log.Printf("Worker %d: processed %d batches", workerID, batchCount)
+}
+
+func (wc *WireConsumer) flushBatch(tc *ba.Transcoder, pending []*stream.Msg, pendingBytes int64) bool {
+	if len(pending) == 0 {
+		return false
+	}
+
+	startBatch := time.Now()
+	var rec arrow.RecordBatch
+	switch wc.outputMode {
+	case OutputModeDenorm:
+		rec = tc.NewDenormalizerRecordBatch()
+	default:
+		rec = tc.NewRecordBatch()
+	}
+	metrics.RecordLatency("batch_output", startBatch)
+	defer rec.Release()
+
+	rows := int(rec.NumRows())
+	cols := int(rec.NumCols())
+	sizeBytes := recordBatchSize(rec)
+
+	metrics.RecordConsumedThroughput(pendingBytes, int64(len(pending)))
+	wc.stats.messages.Add(int64(len(pending)))
+	wc.stats.bytes.Add(pendingBytes)
+
+	if rows > 0 {
+		metrics.RecordBatchMetrics(rows, cols, sizeBytes, len(pending))
+		wc.stats.rows.Add(int64(rows))
+		wc.stats.batches.Add(1)
+	}
+
+	for _, msg := range pending {
+		if err := msg.Ack(); err != nil {
+			log.Printf("batch ack failed: %v", err)
+		}
+	}
+	return rows > 0
 }
 
 func (wc *WireConsumer) Stats() (messages, bytes, errors, rows, batches int64) {
@@ -295,10 +315,9 @@ func (c *LegacyConsumer) Run(ctx context.Context) error {
 		c.totalMessages++
 		c.totalBytes += len(msg.Payload)
 
-		metrics.MessagesConsumed.Inc()
-		metrics.BytesConsumed.Add(float64(len(msg.Payload)))
+		metrics.RecordConsumedThroughput(int64(len(msg.Payload)), 1)
 
-		return nil
+		return msg.Ack()
 	})
 }
 
@@ -308,4 +327,12 @@ func (c *LegacyConsumer) TotalMessages() int {
 
 func (c *LegacyConsumer) TotalBytes() int {
 	return c.totalBytes
+}
+
+func recordBatchSize(rec arrow.RecordBatch) int64 {
+	var total uint64
+	for _, col := range rec.Columns() {
+		total += col.Data().SizeInBytes()
+	}
+	return int64(total)
 }

@@ -1,37 +1,40 @@
-[DEBUG] mode=stream, rate=20000, workers=8, duration=15s, hyper=false
-2026/04/04 18:39:51 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
-2026/04/04 18:39:51 Experiment: mode=stream, rate=20000, workers=8, duration=15s
-2026/04/04 18:39:51 Running Stream Experiment (NATS): rate=20000, duration=15s, workers=8, batch=1000, dist=small, denorm=true
-2026/04/04 18:39:51 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
-Experiment Results (NATS):
+2026/04/04 22:39:22 Worker 4: processed 4 batches
+2026/04/04 22:39:22 Worker 6: processed 4 batches
+2026/04/04 22:39:22 Worker 1: processed 4 batches
+2026/04/04 22:39:22 Worker 2: processed 4 batches
+2026/04/04 22:39:22 Worker 3: processed 4 batches
+2026/04/04 22:39:22 Worker 7: processed 4 batches
+2026/04/04 22:39:22 Worker 0: processed 4 batches
+2026/04/04 22:39:22 Worker 5: processed 4 batches
+Experiment Results:
   Mode: stream
-  Duration: 17.001322375s
-  Messages: 54046
-  Rate: 3178.93 msg/s
+  Duration: 15.00004625s
+  Messages: 31265
+  Rate: 2084.33 msg/s
 === ArrowFlow Telemetry Report ===
-Timestamp: 2026-04-04T18:40:08-05:00
+Timestamp: 2026-04-04T22:39:22-05:00
 
 Throughput:
-  Messages/sec: 3176.07
-  Bytes/sec:    5.61 MB/s
-  Total:        54046 messages, 95.43 MB
+  Messages/sec: 1240.59
+  Bytes/sec:    2.20 MB/s
+  Total:        31265 messages, 55.36 MB
 
 Latency (ns):
-  Produce:      mean=204722, p50=193167, p95=242125, p99=361709, p99.9=753750
-  Consume:      mean=13768, p50=12125, p95=18875, p99=39250, p99.9=158750
-  Batch Output: mean=14417, p50=5375, p95=9250, p99=480958, p99.9=480958
+  Produce:      mean=461500, p50=328042, p95=888625, p99=2038375, p99.9=8391500
+  Consume:      mean=26858, p50=18750, p95=69458, p99=98333, p99.9=133291
+  Batch Output: mean=8629, p50=6458, p95=28416, p99=31417, p99.9=31417
 
 Memory:
-  Heap Alloc:  3.67 MB
-  Heap In Use: 5.64 MB
-  GCs:         1038
-  GC Pause:    0.04 ms
+  Heap Alloc:  59.45 MB
+  Heap In Use: 83.17 MB
+  GCs:         35
+  GC Pause:    0.05 ms
 
 Arrow Integration:
-  Avg Batch:     1000 rows (0.00 KB)
-  Expansion:     0.00 cols/row
-  Denorm Fanout: 1.00 multiplier
+  Avg Batch:     1954 rows (244.13 KB)
+  Expansion:     8.00 columns
+  Denorm Fanout: 2.00 multiplier
 
 Streaming:
-  Consumer Lag: 0 (Peak: 3)
-  Buffer Depth: 0 (Peak: 2)
+  Consumer Lag: 0 (Peak: 61)
+  Buffer Depth: 7265 (Peak: 7940)

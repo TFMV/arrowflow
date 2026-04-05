@@ -40,6 +40,8 @@ type Histogram struct {
 	vals  []float64
 	mu    sync.Mutex
 	size  int
+	next  int
+	full  bool
 }
 
 func NewHistogram(size int) *Histogram {
@@ -50,23 +52,30 @@ func (h *Histogram) Observe(v float64) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.vals = append(h.vals, v)
 	h.sum.Add(int64(v * 1000000000))
 	h.count.Add(1)
 
+	scaled := int64(v * 1000000000)
 	oldMin := h.min.Load()
-	if oldMin == 0 || int64(v*1000000000) < oldMin {
-		h.min.Store(int64(v * 1000000000))
+	if oldMin == 0 || scaled < oldMin {
+		h.min.Store(scaled)
 	}
 	oldMax := h.max.Load()
-	if int64(v*1000000000) > oldMax {
-		h.max.Store(int64(v * 1000000000))
+	if scaled > oldMax {
+		h.max.Store(scaled)
 	}
 
-	if len(h.vals) > h.size {
-		copy(h.vals[:len(h.vals)-1], h.vals[1:])
-		h.vals = h.vals[:len(h.vals)-1]
+	if len(h.vals) < h.size {
+		h.vals = append(h.vals, v)
+		if len(h.vals) == h.size {
+			h.full = true
+			h.next = 0
+		}
+		return
 	}
+
+	h.vals[h.next] = v
+	h.next = (h.next + 1) % h.size
 }
 
 func (h *Histogram) Stats() (count, min, max, mean, p50, p95, p99, p999 float64) {
@@ -192,8 +201,9 @@ func (t *Throughput) Reset() {
 }
 
 var (
-	globalLatency    = NewLatencyDistribution()
-	globalThroughput = NewThroughput()
+	globalLatency      = NewLatencyDistribution()
+	globalThroughput   = NewThroughput()
+	producedThroughput = NewThroughput()
 
 	ProduceLatencyMs       prometheus.Histogram
 	ConsumeLatencyMs       prometheus.Histogram
@@ -310,7 +320,7 @@ func init() {
 
 	ColumnExpansionFactor = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    "arrowflow_column_expansion_factor",
-		Help:    "Ratio of Arrow columns to proto fields",
+		Help:    "Number of Arrow columns emitted per batch",
 		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10},
 	})
 
@@ -360,16 +370,28 @@ func RecordLatency(name string, start time.Time) {
 }
 
 func RecordThroughput(bytes, messages int64) {
-	globalThroughput.Add(bytes, messages)
+	RecordConsumedThroughput(bytes, messages)
+}
+
+func RecordProducedThroughput(bytes, messages int64) {
+	producedThroughput.Add(bytes, messages)
 	MessagesProduced.Add(float64(messages))
 	BytesProduced.Add(float64(bytes))
 
-	msgRate, byteRate := globalThroughput.Rate()
+	msgRate, _ := producedThroughput.Rate()
 	ProducerThroughput.Set(msgRate)
-	ConsumerThroughput.Set(byteRate)
 }
 
-func RecordBatchMetrics(rows, cols int, sizeBytes int64, denormRows int) {
+func RecordConsumedThroughput(bytes, messages int64) {
+	globalThroughput.Add(bytes, messages)
+	MessagesConsumed.Add(float64(messages))
+	BytesConsumed.Add(float64(bytes))
+
+	msgRate, _ := globalThroughput.Rate()
+	ConsumerThroughput.Set(msgRate)
+}
+
+func RecordBatchMetrics(rows, cols int, sizeBytes int64, inputMessages int) {
 	RecordBatchSize.Observe(float64(sizeBytes))
 	RecordBatchRows.Observe(float64(rows))
 
@@ -377,14 +399,14 @@ func RecordBatchMetrics(rows, cols int, sizeBytes int64, denormRows int) {
 	globalLatency.Observe("batch_size_bytes", float64(sizeBytes))
 	globalLatency.Observe("batch_rows", float64(rows))
 
-	if cols > 0 && rows > 0 {
-		expansion := float64(cols) / float64(rows)
+	if cols > 0 {
+		expansion := float64(cols)
 		ColumnExpansionFactor.Observe(expansion)
 		globalLatency.Observe("column_expansion", expansion)
 	}
 
-	if denormRows > 0 {
-		fanout := float64(denormRows) / float64(rows)
+	if inputMessages > 0 {
+		fanout := float64(rows) / float64(inputMessages)
 		DenormFanoutMultiplier.Observe(fanout)
 		globalLatency.Observe("denorm_fanout", fanout)
 	}
@@ -521,6 +543,15 @@ func GenerateTelemetryReport() TelemetryReport {
 	return report
 }
 
+func Reset() {
+	globalLatency = NewLatencyDistribution()
+	globalThroughput = NewThroughput()
+	producedThroughput = NewThroughput()
+	consumerLag = Gauge{}
+	bufferDepth = Gauge{}
+	lastGCPauseNs = 0
+}
+
 func getLatencyStats(name string) LatencyPercentiles {
 	count, _, _, mean, p50, p95, p99, p999 := globalLatency.Stats(name)
 	return LatencyPercentiles{
@@ -567,7 +598,7 @@ func (r TelemetryReport) PrintSummary() {
 
 	fmt.Printf("Arrow Integration:\n")
 	fmt.Printf("  Avg Batch:     %.0f rows (%.2f KB)\n", r.Arrow.AvgBatchRows, r.Arrow.AvgBatchSizeBytes/1024)
-	fmt.Printf("  Expansion:     %.2f cols/row\n", r.Arrow.AvgColumnExpansion)
+	fmt.Printf("  Expansion:     %.2f columns\n", r.Arrow.AvgColumnExpansion)
 	fmt.Printf("  Denorm Fanout: %.2f multiplier\n\n", r.Arrow.AvgDenormFanout)
 
 	fmt.Printf("Streaming:\n")
@@ -575,22 +606,36 @@ func (r TelemetryReport) PrintSummary() {
 	fmt.Printf("  Buffer Depth: %d (Peak: %d)\n", r.Streaming.BufferDepth, r.Streaming.PeakBufferDepth)
 }
 
-func StartTelemetryLoop(interval time.Duration, outputFile string) {
+func StartTelemetryLoop(interval time.Duration, outputFile string) func() {
+	stopCh := make(chan struct{})
+	doneCh := make(chan struct{})
+
 	go func() {
+		defer close(doneCh)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			RecordMemoryStats()
-			RecordGCStats()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				RecordMemoryStats()
+				RecordGCStats()
 
-			if outputFile != "" {
-				report := GenerateTelemetryReport()
-				data, _ := report.ToJSON()
-				os.WriteFile(outputFile, data, 0644)
+				if outputFile != "" {
+					report := GenerateTelemetryReport()
+					data, _ := report.ToJSON()
+					os.WriteFile(outputFile, data, 0644)
+				}
 			}
 		}
 	}()
+
+	return func() {
+		close(stopCh)
+		<-doneCh
+	}
 }
 
 func StartPrometheus(port int) {

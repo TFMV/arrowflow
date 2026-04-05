@@ -2,12 +2,18 @@ package chaos
 
 import (
 	"context"
-	"crypto/rand"
-	"math/big"
+	"fmt"
+	mrand "math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+var chaosRandPool = sync.Pool{
+	New: func() any {
+		return mrand.New(mrand.NewSource(time.Now().UnixNano()))
+	},
+}
 
 type Injector struct {
 	cfg Config
@@ -15,7 +21,7 @@ type Injector struct {
 	active      atomic.Bool
 	mu          sync.RWMutex
 	schemaVer   string
-	burstFactor int
+	burstFactor atomic.Int64
 	targetRate  int
 
 	stats struct {
@@ -117,13 +123,13 @@ func (c *Injector) burstLoop(ctx context.Context) {
 			}
 
 			factor := randInt(c.cfg.BurstFactorMin, c.cfg.BurstFactorMax)
-			c.burstFactor = factor
+			c.burstFactor.Store(int64(factor))
 			c.stats.bursts.Add(1)
 			c.stats.injections.Add(1)
 
 			go func() {
 				time.Sleep(time.Duration(factor/10) * time.Second)
-				c.burstFactor = 0
+				c.burstFactor.Store(0)
 			}()
 		}
 	}
@@ -167,8 +173,8 @@ func (c *Injector) sizeShockLoop(ctx context.Context) {
 }
 
 func (c *Injector) ApplyRate(baseRate int) int {
-	if c.burstFactor > 0 {
-		return baseRate * c.burstFactor
+	if factor := int(c.burstFactor.Load()); factor > 0 {
+		return baseRate * factor
 	}
 	return baseRate
 }
@@ -185,8 +191,7 @@ func (c *Injector) GenerateKey() string {
 	}
 
 	if shouldFloat(c.cfg.HotPartitionRatio) {
-		n, _ := rand.Int(rand.Reader, big.NewInt(int64(c.cfg.HotPartitionCount)))
-		return "hot-" + string('0'+byte(n.Int64()))
+		return fmt.Sprintf("hot-%d", randInt(0, c.cfg.HotPartitionCount))
 	}
 	return "cold-" + randomKey(16)
 }
@@ -211,21 +216,27 @@ func (c *Injector) Stats() (injections, bursts, schemaSwaps, sizeShocks int64) {
 }
 
 func shouldFloat(prob float32) bool {
-	n, _ := rand.Int(rand.Reader, big.NewInt(10000))
-	return int(n.Int64()) < int(prob*10000)
+	rng := chaosRandPool.Get().(*mrand.Rand)
+	defer chaosRandPool.Put(rng)
+	return rng.Intn(10000) < int(prob*10000)
 }
 
 func randInt(min, max int) int {
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min)))
-	return int(n.Int64()) + min
+	if max <= min {
+		return min
+	}
+	rng := chaosRandPool.Get().(*mrand.Rand)
+	defer chaosRandPool.Put(rng)
+	return rng.Intn(max-min) + min
 }
 
 func randomKey(length int) string {
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	rng := chaosRandPool.Get().(*mrand.Rand)
+	defer chaosRandPool.Put(rng)
 	b := make([]byte, length)
 	for i := range b {
-		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
-		b[i] = chars[n.Int64()]
+		b[i] = chars[rng.Intn(len(chars))]
 	}
 	return string(b)
 }
