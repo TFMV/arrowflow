@@ -1,4 +1,4 @@
-# My Friend Built The Protobuf -> Arrow Library I Wish I’d Had Years Ago
+# I Finally Got a Clean Protobuf → Arrow Pipeline—Then the Bottleneck Moved
 
 A friend of mine built a library that immediately made me rethink a bunch of ingestion code I had accepted as inevitable.
 
@@ -12,10 +12,8 @@ Because the normal pipeline usually looks like this:
 
 1. receive bytes from Kafka or NATS
 2. decode into generated structs
-3. walk those structs again
-4. copy everything into Arrow builders
-5. repeat until somebody changes the schema
-6. go update codegen, mapping logic, tests, and all the sharp edges around them
+3. walk those structs again to fill Arrow builders
+4. repeat the whole exercise when the schema changes
 
 That is a lot of CPU, a lot of allocation, and a lot of code nobody actually wants to own.
 
@@ -196,7 +194,7 @@ All three nodes were on one machine, so this is still single-host cluster behavi
 
 ## What The Numbers Actually Say
 
-I reran the full STREAM suite after fixing the harness and landed on a result set that feels honest.
+After fixing several harness issues that were masking configuration differences, I reran the full STREAM suite and landed on a result set that feels honest.
 
 The data lives in `results/all-experiments/results.csv`, but the most interesting parts are easy to summarize.
 
@@ -238,6 +236,8 @@ And this was not fake fanout. The heavy-tail denorm path averaged:
 - `8` Arrow columns in the selected plan
 - `66,323` average rows per emitted batch in the denorm run
 
+This goes against the usual instinct that fanout is always the expensive path. Here, the structured, columnar write path is cheaper than walking nested structures repeatedly.
+
 That result is specific to this event shape and this denorm plan, but it is still impressive. My friend’s library is doing real structural work here, not just flattening a few scalars.
 
 ### The broker path became the long pole
@@ -258,6 +258,23 @@ Once the parser and Arrow append path get cheap enough, the bottleneck moves out
 - queue depth
 
 That is exactly the shift I wanted the harness to expose. Once the local decode path gets good enough, the bottleneck stops hiding.
+
+## The Moment The Bottleneck Moved
+
+At some point in this run, the results stopped being about parsing.
+
+The numbers flattened, but not because the system was idle.
+
+They flattened because the hot path had moved.
+
+Not inside the process.
+Not inside the library.
+
+Out into the broker.
+
+Once Protobuf decoding and Arrow writes got cheap enough, the system stopped being CPU-bound and became coordination-bound.
+
+That is the line I was trying to find.
 
 ## Where The System Actually Starts To Bend
 
@@ -287,9 +304,7 @@ At `50000 msg/s` offered load:
 - `8 workers`: `1759.39 msg/s`, `52.7 us`
 - `16 workers`: `2133.66 msg/s`, `51.5 us`
 
-So no, this was not a case where “just add workers” solved it.
-
-That is another sign that the system is not compute-bound in the naive sense. Coordination and memory behavior are already in charge.
+So no, this was not a case where “just add workers” solved it. Coordination and memory behavior were already in charge.
 
 ## Why I Think `bufarrowlib` Matters
 
