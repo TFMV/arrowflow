@@ -78,6 +78,7 @@ func main() {
 	}
 
 	prod := producer.NewWireProducer(p, cfg, wc)
+	prod.AttachInjector(injector)
 
 	log.Printf("Starting chaos wire producer: mode=%s, rate=%d, chaos=%v",
 		*mode, *rate, *chaosBurst || *chaosSchema || *chaosHotPartition || *chaosSizeShock)

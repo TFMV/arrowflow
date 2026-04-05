@@ -1,36 +1,43 @@
-2026/04/04 18:46:35 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
-2026/04/04 18:46:35 Chaos Producer: rate=25000, mode=burst, workers=8, hyper=true
+2026/04/04 22:49:30 Worker 3: processed 4 batches
+2026/04/04 22:49:30 Worker 5: processed 4 batches
+2026/04/04 22:49:30 Worker 1: processed 4 batches
+2026/04/04 22:49:30 Worker 0: processed 4 batches
+2026/04/04 22:49:30 Worker 6: processed 4 batches
+2026/04/04 22:49:30 Worker 4: processed 4 batches
+2026/04/04 22:49:30 Worker 2: processed 4 batches
+2026/04/04 22:49:30 Worker 7: processed 4 batches
 Chaos Results:
-  Messages (Produced): 33891
-  Messages (Consumed): 33882
-  Bytes: 317476299
-  Injections: 0
+  Mode: burst
+  Duration: 20.000373125s
+  Messages (Consumed): 29910
+  Injections: 1
   Bursts: 0
-  Schema Swaps: 0
+  Schema Swaps: 1
+  Size Shocks: 0
 === ArrowFlow Telemetry Report ===
-Timestamp: 2026-04-04T18:46:57-05:00
+Timestamp: 2026-04-04T22:49:30-05:00
 
 Throughput:
-  Messages/sec: 0.00
-  Bytes/sec:    0.00 MB/s
-  Total:        0 messages, 0.00 MB
+  Messages/sec: 991.22
+  Bytes/sec:    8.63 MB/s
+  Total:        29910 messages, 260.40 MB
 
 Latency (ns):
-  Produce:      mean=287017, p50=229500, p95=602041, p99=962625, p99.9=2730458
-  Consume:      mean=5304, p50=3917, p95=10667, p99=28250, p99.9=126292
-  Batch Output: mean=5003, p50=4667, p95=6334, p99=14125, p99.9=14125
+  Produce:      mean=633927, p50=387125, p95=935042, p99=2230334, p99.9=13278625
+  Consume:      mean=34272, p50=17750, p95=67584, p99=131583, p99.9=330166
+  Batch Output: mean=22126, p50=7084, p95=83709, p99=90291, p99.9=90291
 
 Memory:
-  Heap Alloc:  10.65 MB
-  Heap In Use: 12.69 MB
-  GCs:         1338
-  GC Pause:    0.05 ms
+  Heap Alloc:  321.58 MB
+  Heap In Use: 344.97 MB
+  GCs:         29
+  GC Pause:    0.04 ms
 
 Arrow Integration:
-  Avg Batch:     0 rows (0.00 KB)
-  Expansion:     0.00 cols/row
-  Denorm Fanout: 0.00 multiplier
+  Avg Batch:     68173 rows (8960.13 KB)
+  Expansion:     8.00 columns
+  Denorm Fanout: 73.04 multiplier
 
 Streaming:
-  Consumer Lag: 0 (Peak: 0)
-  Buffer Depth: 0 (Peak: 2)
+  Consumer Lag: 0 (Peak: 23)
+  Buffer Depth: 5910 (Peak: 7839)

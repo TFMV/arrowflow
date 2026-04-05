@@ -1,37 +1,36 @@
-[DEBUG] mode=stream, rate=50000, workers=4, duration=15s, hyper=true
-2026/04/04 18:45:44 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
-2026/04/04 18:45:44 Experiment: mode=stream, rate=50000, workers=4, duration=15s
-2026/04/04 18:45:44 Running Stream Experiment (NATS): rate=50000, duration=15s, workers=4, batch=1000, dist=heavy-tail, denorm=true
-2026/04/04 18:45:44 Found proto at: /Users/tfmv/arrowflow/arrowflow/internal/schemas/event.proto
-Experiment Results (NATS):
+2026/04/04 22:48:07 Worker 1: processed 8 batches
+2026/04/04 22:48:07 Worker 3: processed 8 batches
+2026/04/04 22:48:07 Worker 0: processed 8 batches
+2026/04/04 22:48:07 Worker 2: processed 8 batches
+Experiment Results:
   Mode: stream
-  Duration: 17.001374209s
-  Messages: 30112
-  Rate: 1771.15 msg/s
+  Duration: 15.000051s
+  Messages: 30861
+  Rate: 2057.39 msg/s
 === ArrowFlow Telemetry Report ===
-Timestamp: 2026-04-04T18:46:01-05:00
+Timestamp: 2026-04-04T22:48:07-05:00
 
 Throughput:
-  Messages/sec: 1769.83
-  Bytes/sec:    15.65 MB/s
-  Total:        30112 messages, 266.25 MB
+  Messages/sec: 1225.28
+  Bytes/sec:    10.70 MB/s
+  Total:        30861 messages, 269.40 MB
 
 Latency (ns):
-  Produce:      mean=194947, p50=147250, p95=423375, p99=533625, p99.9=872833
-  Consume:      mean=5192, p50=3500, p95=10125, p99=33250, p99.9=75750
-  Batch Output: mean=5796, p50=5333, p95=7333, p99=17750, p99.9=17750
+  Produce:      mean=932120, p50=603125, p95=1925958, p99=4451791, p99.9=20616208
+  Consume:      mean=39584, p50=26625, p95=96334, p99=163542, p99.9=462291
+  Batch Output: mean=16414, p50=8917, p95=64750, p99=92208, p99.9=92208
 
 Memory:
-  Heap Alloc:  8.80 MB
-  Heap In Use: 10.80 MB
-  GCs:         1118
-  GC Pause:    0.03 ms
+  Heap Alloc:  198.02 MB
+  Heap In Use: 207.03 MB
+  GCs:         43
+  GC Pause:    0.07 ms
 
 Arrow Integration:
-  Avg Batch:     1000 rows (0.00 KB)
-  Expansion:     0.00 cols/row
-  Denorm Fanout: 1.00 multiplier
+  Avg Batch:     70059 rows (9208.44 KB)
+  Expansion:     8.00 columns
+  Denorm Fanout: 72.60 multiplier
 
 Streaming:
-  Consumer Lag: 0 (Peak: 0)
-  Buffer Depth: 0 (Peak: 4)
+  Consumer Lag: 0 (Peak: 92)
+  Buffer Depth: 2861 (Peak: 3946)

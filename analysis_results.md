@@ -1,65 +1,117 @@
-# Performance Analysis: ArrowFlow Evaluation on Mac M4
+# ArrowFlow Analysis Results
 
-This report summarizes the performance characterization and scientific findings of the ArrowFlow pipeline, evaluating `bufarrowlib` and `HyperType` efficiencies under various streaming pressures.
+## Executive Summary
 
-## TLDR; Executive Summary
-- **HyperType Dominance**: HyperType (JIT decoding) consistently provides a **4x to 6x latency reduction** across all message distributions.
-- **Throughput Plateau**: The current execution environment (Mac M4 + NATS JetStream) plateaus at **~1,900 msg/sec**, regardless of worker scaling or input rate.
-- **Optimal Configuration**: A batch size of **1,000 rows** represents the "sweet spot," balancing GC pressure (~1.1k cycles) with stable consumption latency (~6.7μs).
-- **Denormalization Efficiency**: Flattening structural data (denorm) is unexpectedly **more efficient** for `bufarrowlib` than nested processing in this schema, yielding a **72% reduction** in mean consumption latency.
+This run used the corrected ArrowFlow harness and a real 3-node JetStream cluster with `Replicas=3` and file storage. The system is substantially more trustworthy than the earlier research-only version because the benchmark path now acks after Arrow flush, isolates worker state, uses real denorm fanout, and honors command flags correctly.
 
----
+The measured bottleneck is now clearer:
+- the Arrow/`bufarrowlib` path is fast enough to benefit from HyperType
+- the replicated broker path still dominates end-to-end throughput at higher offered rates
+- aggressive batch sizes mostly trade memory and buffer depth for little throughput gain
 
-## Key Results & Findings
+## Environment
 
-### 1. The HyperType Advantage
-The evaluation compared standard decoding (`ht_false`) against HyperType JIT decoding (`ht_true`) across four message size distributions:
+- Host: single machine Docker cluster
+- Broker: 3-node NATS JetStream
+- Stream storage: file
+- Replication: 3
+- Date: April 4, 2026
+- Result matrix: `results/all-experiments/results.csv`
 
-| Distribution | Baseline Latency (mean) | HyperType Latency (mean) | Improvement |
+## Key Findings
+
+### 1. HyperType is consistently beneficial
+
+Mean consume-latency speedup versus `--hyper=false`:
+
+| Distribution | HyperType Mean | Baseline Mean | Speedup |
 | :--- | :--- | :--- | :--- |
-| **Small** | 12,897 ns | 2,913 ns | **4.4x** |
-| **Medium** | 17,484 ns | 3,642 ns | **4.8x** |
-| **Large** | 45,635 ns | 10,691 ns | **4.2x** |
-| **Heavy-Tail** | 31,628 ns | 5,015 ns | **6.3x** |
+| Small | 9.1 us | 26.9 us | 2.95x |
+| Medium | 19.0 us | 37.2 us | 1.95x |
+| Large | 78.7 us | 119.5 us | 1.52x |
+| Heavy-tail | 37.5 us | 75.8 us | 2.02x |
 
-**Finding**: HyperType is not just for large messages. The 4.4x speedup on `small` payloads suggests the efficiency of compiled field access on the Mac M4 far outweighs the JIT context overhead even at minimal message sizes.
+HyperType also improved observed throughput in every distribution in this run.
 
-### 2. Throughput Saturation & Scaling Indicators
-Testing input rates from 10,000 to 200,000 messages/sec revealed a consistent throughput ceiling:
+### 2. Batch size `1000` remains the best operating point
 
-- **Observed Plateau**: All tests beyond the saturation point converged to **1,850 - 1,950 msg/s**.
-- **Worker Scaling**: Increasing workers from 2 to 16 yielded **0% improvement** in total throughput, remaining fixed at ~1,900 msg/s.
-- **Analysis**: This indicates a single-threaded bottleneck, likely in the NATS consumer fetch mechanism or the synchronous RecordBatch emission path within the harness.
+For heavy-tail STREAM mode at `50000 msg/s` offered load:
 
-### 3. Structural Efficiency: Nested vs. Denormalized
-We compared processing raw nested events against denormalizing them into flat Arrow rows:
+| Batch | Observed Rate | Mean Consume | Heap |
+| :--- | :--- | :--- | :--- |
+| 100 | 2253.99 msg/s | 41.5 us | 38.45 MB |
+| 500 | 2142.19 msg/s | 40.2 us | 241.77 MB |
+| 1000 | 2402.62 msg/s | 36.5 us | 223.98 MB |
+| 5000 | 2068.75 msg/s | 48.7 us | 1343.04 MB |
+| 10000 | 2199.06 msg/s | 53.5 us | 1477.80 MB |
 
-- **Nested Latency**: 19,362 ns (Mean Consume)
-- **Denorm Latency**: 5,376 ns (Mean Consume)
-- **Finding**: Denormalization into flat rows is significantly faster (**72% lower latency**) for `bufarrowlib`. The denormalization plan in `bufarrowlib` appears highly optimized relative to generic recursive traversal of nested Protobuf structures.
+Large batches drastically increased heap usage and internal buffer depth without producing better throughput.
 
-### 4. Batch Size & GC Behavior
-Sweeping batch sizes from 100 to 10,000 rows provided insights into memory pressure:
+### 3. Denormalized Arrow output wins on this schema
 
-- **GC Behavior**: GC counts remained relatively stable (~1,100 - 1,200) across all batch sizes, but showed a slight downward trend at the highest batch settings (10k rows), suggesting better allocation amortisation.
-- **Consumption Latency**: Latency remained stable (~5.4μs - 6.7μs) across the range, with a slight increase at the 10,000-row mark.
+At `50000 msg/s`, `8 workers`, `batch=1000`:
 
----
+| Mode | Observed Rate | Mean Consume | Fanout |
+| :--- | :--- | :--- | :--- |
+| Nested | 1998.80 msg/s | 52.8 us | 1.00x |
+| Denorm | 2932.68 msg/s | 32.3 us | 72.37x |
 
-## Implementation & bufarrowlib Constraints
+This result is specific to the current denorm plan and schema shape. It does not mean denormalization is free; it means the current `bufarrowlib` denorm path is still cheaper than the nested path for this event structure, even while producing a very large row fanout.
 
-The following constraints were documented during the evaluation process (`experiment-log.md`):
+### 4. Throughput ceiling is broker-path dominated
 
-> [!IMPORTANT]
-> **Concurrency Safety**: `Transcoder` and `HyperType` contexts are **NOT thread-safe**. Concurrent access to the same context will cause segmentation violations or internal state corruption. **Each worker must use its own isolated Transcoder and HyperType instances.**
+Saturation sweep:
 
-> [!NOTE]
-> **Precision Requirements**: Standard millisecond benchmarks are insufficient for `bufarrowlib`. All performance evaluations must use **nanosecond resolution** to capture the 2μs - 15μs hot-path efficiencies accurately.
+| Offered Rate | Observed Rate | Mean Consume | Mean Produce |
+| :--- | :--- | :--- | :--- |
+| 10000 | 1383.99 msg/s | 45.0 us | 680.8 us |
+| 50000 | 1589.45 msg/s | 66.3 us | 1204.9 us |
+| 100000 | 2994.99 msg/s | 43.0 us | 1625.7 us |
+| 150000 | 3511.83 msg/s | 41.2 us | 1950.1 us |
+| 200000 | 5404.24 msg/s | 32.5 us | 1445.7 us |
 
-> [!TIP]
-> **Transport Overhead**: Broker settings significantly impact observed performance. Low-latency evaluation requires a pre-configured NATS JetStream server; otherwise, `Produce` latencies can spike to ~500ms due to unbuffered direct NATS fallback logic.
+The ceiling moved materially once the harness bugs were fixed, but the dominant cost is still in broker admission and replication rather than Arrow append.
 
----
-- **Hardware Profile**: Mac M4 (Apple Silicon)
-- **Broker Config**: NATS JetStream (Memory Storage Fallback)
-- **Evaluation Date**: April 4, 2026
+### 5. Worker scaling is not linear
+
+At `50000 msg/s` offered load:
+
+| Workers | Observed Rate | Mean Consume | Heap |
+| :--- | :--- | :--- | :--- |
+| 2 | 2120.17 msg/s | 36.2 us | 115.32 MB |
+| 4 | 2057.39 msg/s | 39.6 us | 198.02 MB |
+| 8 | 1759.39 msg/s | 52.7 us | 321.36 MB |
+| 16 | 2133.66 msg/s | 51.5 us | 928.94 MB |
+
+More workers increase isolation but do not buy linear throughput in this environment. The broker path and batching behavior dominate first.
+
+### 6. Chaos mode stressed memory and buffering, not broker lag
+
+Chaos run summary:
+- Consumed messages: `28892`
+- Duration: `20.0s`
+- Produce mean latency: `655.4 us`
+- Consume mean latency: `38.7 us`
+- Heap alloc: `365.48 MB`
+- Peak buffer depth: `7817`
+- Peak consumer lag: `0`
+
+That profile suggests the consumer-side in-process backlog was the first pressure surface, not broker backlog.
+
+## Integrity Notes
+
+The old invalid conclusions are no longer applicable. Specifically:
+- STREAM mode no longer silently acks before Arrow processing.
+- The benchmark CLI now honors subcommand flags.
+- Denorm fanout numbers come from repeated-field plans instead of scalar-only plans.
+- The cluster path is replicated JetStream, not single-replica in-memory fallback.
+- Final CSV values were regenerated from the final command reports, which are the stable end-of-run measurements.
+
+## Overall Read
+
+ArrowFlow is now a credible research and systems-validation harness for this workload. It is still not a substitute for multi-host production testing, but it now exercises the right failure domains:
+- replicated broker writes
+- worker isolation
+- Arrow record lifecycle correctness
+- meaningful denorm fanout
+- deterministic benchmark reporting

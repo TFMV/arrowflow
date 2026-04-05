@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -17,6 +17,7 @@ import (
 
 	"github.com/TFMV/arrowflow/internal/chaos"
 	"github.com/TFMV/arrowflow/internal/config"
+	"github.com/TFMV/arrowflow/internal/consumer"
 	"github.com/TFMV/arrowflow/internal/metrics"
 	"github.com/TFMV/arrowflow/internal/producer"
 	"github.com/TFMV/arrowflow/internal/schemas/pb"
@@ -29,500 +30,239 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type ExperimentResult struct {
+	Mode       string
+	Duration   time.Duration
+	Messages   int64
+	Bytes      int64
+	Errors     int64
+	Report     metrics.TelemetryReport
+	RatePerSec float64
+}
+
 func main() {
-	flag.Usage = func() {
-		fmt.Printf("ArrowFlow - Streaming Protobuf → Arrow Pipeline\n\n")
-		fmt.Printf("Usage: arrowflow <command> [options]\n\n")
-		fmt.Printf("Commands:\n")
-		fmt.Printf("  producer    Run streaming producer\n")
-		fmt.Printf("  consumer    Run streaming consumer\n")
-		fmt.Printf("  benchmark   Run throughput benchmark\n")
-		fmt.Printf("  experiment  Run experiment modes\n")
-		fmt.Printf("  chaos       Run chaos injection producer\n\n")
-		fmt.Printf("Examples:\n")
-		fmt.Printf("  arrowflow producer --rate 100000 --mode burst\n")
-		fmt.Printf("  arrowflow consumer --batch-size 1024 --hypertype\n")
-		fmt.Printf("  arrowflow benchmark --messages 1000000 --mode stress\n")
-		fmt.Printf("  arrowflow experiment --mode direct --rate 50000\n")
-		fmt.Printf("  arrowflow chaos --rate 10000 --chaos-burst\n\n")
-		flag.PrintDefaults()
-	}
-
-	flag.Parse()
-
-	if flag.NArg() < 1 {
-		flag.Usage()
+	if len(os.Args) < 2 {
+		usage()
 		os.Exit(1)
 	}
 
-	cmd := flag.Arg(0)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		log.Println("Received signal, shutting down...")
-		cancel()
-	}()
+	metrics.Reset()
+	stopTelemetry := metrics.StartTelemetryLoop(time.Second, "telemetry.json")
 
-	metrics.StartTelemetryLoop(5*time.Second, "telemetry.json")
+	cmd := os.Args[1]
+	args := os.Args[2:]
 
 	var err error
 	switch cmd {
 	case "producer":
-		err = runProducer(ctx)
+		err = runProducer(ctx, args)
 	case "consumer":
-		err = runConsumer(ctx)
+		err = runConsumer(ctx, args)
 	case "benchmark":
-		err = runBenchmark(ctx)
+		err = runBenchmark(ctx, args)
 	case "experiment":
-		err = runExperiment(ctx)
+		err = runExperiment(ctx, args)
 	case "chaos":
-		err = runChaos(ctx)
+		err = runChaos(ctx, args)
 	default:
-		fmt.Printf("Unknown command: %s\n", cmd)
-		flag.Usage()
+		usage()
 		os.Exit(1)
 	}
 
-	if err != nil && err != context.Canceled {
+	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("Error: %v", err)
 	}
 
+	stopTelemetry()
 	report := metrics.GenerateTelemetryReport()
+	writeTelemetry(report)
 	report.PrintSummary()
 }
 
-func runProducer(ctx context.Context) error {
-	rate := flag.Int("rate", 1000, "Messages per second")
-	mode := flag.String("mode", "steady", "Mode: steady, burst, sinusoidal")
-	sizeDist := flag.String("size-dist", "heavy-tail", "Size: small, medium, large, heavy-tail")
-	burstFactor := flag.Int("burst-factor", 50, "Burst multiplier")
-	schemaVer := flag.String("schema-version", "1.0.0", "Schema version")
-	flag.Parse()
+func usage() {
+	fmt.Printf("ArrowFlow - Streaming Protobuf -> Arrow Pipeline\n\n")
+	fmt.Printf("Usage: arrowflow <command> [options]\n\n")
+	fmt.Printf("Commands:\n")
+	fmt.Printf("  producer    Run streaming producer\n")
+	fmt.Printf("  consumer    Run streaming consumer\n")
+	fmt.Printf("  benchmark   Run direct protobuf->Arrow benchmark\n")
+	fmt.Printf("  experiment  Run direct/stream experiment modes\n")
+	fmt.Printf("  chaos       Run chaos injection experiment\n")
+}
+
+func runProducer(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("producer", flag.ExitOnError)
+	rate := fs.Int("rate", 1000, "Messages per second")
+	mode := fs.String("mode", "steady", "Mode: steady, burst, sinusoidal")
+	sizeDist := fs.String("size-dist", "heavy-tail", "Size: small, medium, large, heavy-tail")
+	burstFactor := fs.Int("burst-factor", 50, "Burst multiplier")
+	schemaVer := fs.String("schema-version", "1.0.0", "Schema version")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	cfg := config.Load()
-
 	p, err := stream.NewProducer(cfg)
 	if err != nil {
 		return fmt.Errorf("create producer: %w", err)
 	}
 	defer p.Close()
 
-	wc := producer.WireConfig{
+	prod := producer.NewWireProducer(p, cfg, producer.WireConfig{
 		Mode:          *mode,
 		Rate:          *rate,
 		BurstFactor:   *burstFactor,
 		BurstDuration: 5 * time.Second,
 		SizeDist:      *sizeDist,
 		SchemaVersion: *schemaVer,
-	}
+	})
 
-	prod := producer.NewWireProducer(p, cfg, wc)
 	log.Printf("Producer: rate=%d, mode=%s, size=%s", *rate, *mode, *sizeDist)
-
 	err = prod.Run(ctx)
-	msgs, bytes, _, _ := prod.Stats()
-	log.Printf("Produced: %d messages, %d bytes", msgs, bytes)
+	msgs, bytes, errs, bursts := prod.Stats()
+	log.Printf("Produced: messages=%d bytes=%d errors=%d bursts=%d", msgs, bytes, errs, bursts)
 	return err
 }
 
-func runConsumer(ctx context.Context) error {
-	workers := flag.Int("workers", runtime.NumCPU(), "Worker goroutines")
-	batchSize := flag.Int("batch-size", 1000, "Batch size")
-	mode := flag.String("mode", "denorm", "Mode: nested, denorm")
-	hyper := flag.Bool("hypertype", true, "Enable HyperType")
-	flag.Parse()
+func runConsumer(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("consumer", flag.ExitOnError)
+	workers := fs.Int("workers", runtime.NumCPU(), "Worker goroutines")
+	batchSize := fs.Int("batch-size", 1000, "Batch size")
+	mode := fs.String("mode", "denorm", "Mode: nested, denorm")
+	hyper := fs.Bool("hypertype", true, "Enable HyperType")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	cfg := config.Load()
-
 	s, err := stream.NewConsumer(cfg)
 	if err != nil {
 		return fmt.Errorf("create consumer: %w", err)
 	}
 	defer s.Close()
 
-	protoPath := findProtoPath()
-	protoDir := filepath.Dir(protoPath)
-	protoFile := filepath.Base(protoPath)
-
-	fd, err := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
-	if err != nil {
-		return fmt.Errorf("compile proto: %w", err)
-	}
-	md, err := ba.GetMessageDescriptorByName(fd, "Event")
-	if err != nil {
-		return fmt.Errorf("get descriptor: %w", err)
-	}
-
-	var ht *ba.HyperType
-	if *hyper {
-		ht = ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))
-	}
-
-	paths := []pbpath.PlanPathSpec{
-		pbpath.PlanPath("schema_version"),
-		pbpath.PlanPath("event_timestamp"),
-		pbpath.PlanPath("user.user_id"),
-		pbpath.PlanPath("session.session_id"),
-		pbpath.PlanPath("tracing.trace_id"),
-		pbpath.PlanPath("payload.event_type"),
-	}
-
-	tc, err := ba.New(md, memory.DefaultAllocator,
-		ba.WithHyperType(ht),
-		ba.WithDenormalizerPlan(paths...),
-	)
-	if err != nil {
-		return fmt.Errorf("create transcoder: %w", err)
-	}
-	defer tc.Release()
-
-	log.Printf("Consumer: workers=%d, batch=%d, mode=%s, hyper=%v", *workers, *batchSize, *mode, *hyper)
-
-	var totalMsgs int64
-	err = s.Consume(ctx, cfg.Topic, func(msg *stream.Msg) error {
-		ts := time.Now()
-		if err := tc.AppendDenormRaw(msg.Payload); err != nil {
-			return err
-		}
-		metrics.RecordLatency("consume", ts)
-		atomic.AddInt64(&totalMsgs, 1)
-
-		if totalMsgs%int64(*batchSize) == 0 {
-			startBatch := time.Now()
-			rec := tc.NewDenormalizerRecordBatch()
-			metrics.RecordLatency("batch_output", startBatch)
-			rec.Release()
-		}
-		return nil
+	cons, err := consumer.NewWireConsumer(s, cfg, consumer.ConsumerConfig{
+		Workers:     *workers,
+		OutputMode:  *mode,
+		BatchSize:   *batchSize,
+		EnableHyper: *hyper,
+		DenormPaths: consumer.DefaultConsumerConfig.DenormPaths,
 	})
-
-	log.Printf("Consumed: %d messages", atomic.LoadInt64(&totalMsgs))
-	return err
-}
-
-func runBenchmark(ctx context.Context) error {
-	messages := flag.Int("messages", 100000, "Total messages")
-	size := flag.Int("size", 4096, "Message size")
-	mode := flag.String("mode", "steady", "Mode: steady, stress")
-	flag.Parse()
-
-	fd, err := ba.CompileProtoToFileDescriptor("./internal/schemas/event.proto", []string{"."})
 	if err != nil {
-		return fmt.Errorf("compile proto: %w", err)
+		return err
 	}
-	md, err := ba.GetMessageDescriptorByName(fd, "Event")
-	if err != nil {
-		return fmt.Errorf("get descriptor: %w", err)
+	defer cons.Close()
+
+	log.Printf("Consumer: workers=%d batch=%d mode=%s hyper=%v", *workers, *batchSize, *mode, *hyper)
+	if err := cons.Run(ctx); err != nil {
+		return err
 	}
-
-	ht := ba.NewHyperType(md)
-	paths := []pbpath.PlanPathSpec{pbpath.PlanPath("user.user_id"), pbpath.PlanPath("payload.event_type")}
-
-	tc, err := ba.New(md, memory.DefaultAllocator, ba.WithHyperType(ht), ba.WithDenormalizerPlan(paths...))
-	if err != nil {
-		return fmt.Errorf("create transcoder: %w", err)
-	}
-	defer tc.Release()
-
-	log.Printf("Benchmark: messages=%d, size=%d, mode=%s", *messages, *size, *mode)
-
-	start := time.Now()
-	total := 0
-
-	for i := 0; i < *messages; i++ {
-		msg := &pb.Event{
-			SchemaVersion: "1.0.0",
-			User:          &pb.Event_UserContext{UserId: fmt.Sprintf("user-%d", i)},
-			Payload:       &pb.Event_Payload{EventType: "test", RawData: make([]byte, *size)},
-		}
-		raw, _ := proto.Marshal(msg)
-		tc.AppendDenormRaw(raw)
-		total++
-	}
-
-	elapsed := time.Since(start)
-	rate := float64(total) / elapsed.Seconds()
-	mbps := float64(total**size) / elapsed.Seconds() / 1024 / 1024
-
-	fmt.Printf("Results:\n")
-	fmt.Printf("  Messages: %d\n", total)
-	fmt.Printf("  Time: %v\n", elapsed)
-	fmt.Printf("  Rate: %.2f msg/s\n", rate)
-	fmt.Printf("  Throughput: %.2f MB/s\n", mbps)
+	msgs, bytes, errs, rows, batches := cons.Stats()
+	log.Printf("Consumed: messages=%d bytes=%d errors=%d rows=%d batches=%d", msgs, bytes, errs, rows, batches)
 	return nil
 }
 
-func runExperiment(ctx context.Context) error {
-	// Create a custom flag set to properly parse experiment-specific flags
+func runBenchmark(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("benchmark", flag.ExitOnError)
+	messages := fs.Int("messages", 100000, "Total messages")
+	size := fs.Int("size", 4096, "Payload size")
+	workers := fs.Int("workers", runtime.NumCPU(), "Workers")
+	batchSize := fs.Int("batch-size", 1000, "Batch flush size")
+	hyper := fs.Bool("hyper", true, "Enable HyperType")
+	denorm := fs.Bool("denorm", true, "Use denormalized Arrow output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	result, err := runDirectPipeline(ctx, directPipelineConfig{
+		Mode:        "benchmark",
+		Rate:        0,
+		Workers:     *workers,
+		Duration:    0,
+		Messages:    *messages,
+		BatchSize:   *batchSize,
+		SizeDist:    "large",
+		EnableHyper: *hyper,
+		Denorm:      *denorm,
+		FixedSize:   *size,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Results:\n")
+	fmt.Printf("  Messages: %d\n", result.Messages)
+	fmt.Printf("  Time: %v\n", result.Duration)
+	fmt.Printf("  Rate: %.2f msg/s\n", result.RatePerSec)
+	fmt.Printf("  Throughput: %.2f MB/s\n", float64(result.Bytes)/result.Duration.Seconds()/1024/1024)
+	return nil
+}
+
+func runExperiment(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("experiment", flag.ExitOnError)
 	mode := fs.String("mode", "direct", "Mode: direct, stress, stream")
 	rate := fs.Int("rate", 10000, "Messages per second")
 	workers := fs.Int("workers", runtime.NumCPU(), "Workers")
 	duration := fs.Duration("duration", 30*time.Second, "Duration")
 	hyper := fs.Bool("hyper", true, "Enable HyperType")
-	batchSize := fs.Int("batch-size", 1000, "Batch size for Arrow records")
-	sizeDist := fs.String("size-dist", "heavy-tail", "Size distribution (small, medium, large, heavy-tail)")
-	denorm := fs.Bool("denorm", true, "Enable denormalization (vs nested)")
-
-	// Get unparsed args (skip the command name)
-	args := os.Args[2:]
+	batchSize := fs.Int("batch-size", 1000, "Batch size")
+	sizeDist := fs.String("size-dist", "heavy-tail", "Size distribution")
+	denorm := fs.Bool("denorm", true, "Enable denormalization")
+	maxRate := fs.Int("max-rate", 100000, "Maximum stress rate")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	fmt.Printf("[DEBUG] mode=%s, rate=%d, workers=%d, duration=%v, hyper=%v\n", *mode, *rate, *workers, *duration, *hyper)
-
-	// Find project root (where internal/schemas exists)
-	protoPath := findProtoPath()
-	protoDir := filepath.Dir(protoPath)
-	protoFile := filepath.Base(protoPath)
-
-	fd, err := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
-	if err != nil {
-		return fmt.Errorf("compile proto: %w", err)
-	}
-	md, err := ba.GetMessageDescriptorByName(fd, "Event")
-	if err != nil {
-		return fmt.Errorf("get descriptor: %w", err)
-	}
-
-	paths := []pbpath.PlanPathSpec{
-		pbpath.PlanPath("schema_version"),
-		pbpath.PlanPath("event_timestamp"),
-		pbpath.PlanPath("user.user_id"),
-		pbpath.PlanPath("session.session_id"),
-	}
-
-	log.Printf("Experiment: mode=%s, rate=%d, workers=%d, duration=%v", *mode, *rate, *workers, *duration)
-
-	var totalMsgs int64
-	var totalBytes int64
-
-	ratePerWorker := *rate / *workers
-	interval := time.Second / time.Duration(ratePerWorker)
-	if interval == 0 {
-		interval = time.Microsecond
-	}
-
-	start := time.Now()
-	deadline := start.Add(*duration)
-
-	if *mode == "stream" {
-		return runStreamExperiment(ctx, *rate, *duration, *workers, *hyper, *batchSize, *sizeDist, *denorm)
-	}
-
-	var wg sync.WaitGroup
-	for i := 0; i < *workers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			
-			// Initialize WireProducer for this worker to generate data
-			cfg := config.Load()
-			wp := producer.NewWireProducer(nil, cfg, producer.WireConfig{
-				SizeDist: *sizeDist,
-			})
-
-			htWorker := ba.NewHyperType(md)
-			var opts []ba.Option
-			opts = append(opts, ba.WithHyperType(htWorker))
-			if *denorm {
-				opts = append(opts, ba.WithDenormalizerPlan(paths...))
-			}
-
-			tc, err := ba.New(md, memory.DefaultAllocator, opts...)
-			if err != nil {
-				log.Printf("worker %d: create transcoder: %v", workerID, err)
-				return
-			}
-			defer tc.Release()
-
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if time.Now().After(deadline) {
-						return
-					}
-					
-					evt := wp.GenerateWireMessage()
-					raw, _ := proto.Marshal(evt)
-					
-					start := time.Now()
-					if *denorm {
-						tc.AppendDenormRaw(raw)
-					} else {
-						tc.AppendRaw(raw)
-					}
-					metrics.RecordLatency("consume", start)
-					atomic.AddInt64(&totalMsgs, 1)
-					atomic.AddInt64(&totalBytes, int64(len(raw)))
-				}
-			}
-		}(i)
-	}
-
-	wg.Wait()
-
-	elapsed := time.Since(start)
-	rateCalc := float64(totalMsgs) / elapsed.Seconds()
-
-	fmt.Printf("Experiment Results:\n")
-	fmt.Printf("  Mode: %s\n", *mode)
-	fmt.Printf("  Duration: %v\n", elapsed)
-	fmt.Printf("  Messages: %d\n", totalMsgs)
-	fmt.Printf("  Rate: %.2f msg/s\n", rateCalc)
-	return nil
-}
-
-func runStreamExperiment(ctx context.Context, rate int, duration time.Duration, workers int, hyper bool, batchSize int, sizeDist string, denorm bool) error {
-	log.Printf("Running Stream Experiment (NATS): rate=%d, duration=%v, workers=%d, batch=%d, dist=%s, denorm=%v", rate, duration, workers, batchSize, sizeDist, denorm)
-	cfg := config.Load()
-
-	p, err := stream.NewProducer(cfg)
-	if err != nil {
-		return fmt.Errorf("create producer: %w", err)
-	}
-	defer p.Close()
-
-	s, err := stream.NewConsumer(cfg)
-	if err != nil {
-		return fmt.Errorf("create consumer: %w", err)
-	}
-	defer s.Close()
-
-	protoPath := findProtoPath()
-	protoDir := filepath.Dir(protoPath)
-	protoFile := filepath.Base(protoPath)
-
-	fd, err := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
-	if err != nil {
-		return err
-	}
-	md, err := ba.GetMessageDescriptorByName(fd, "Event")
-	if err != nil {
-		return err
-	}
-
-	var ht *ba.HyperType
-	if hyper {
-		// HyperType benefits from higher recompile threshold for large batches
-		ht = ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))
-	}
-
-	paths := []pbpath.PlanPathSpec{
-		pbpath.PlanPath("schema_version"),
-		pbpath.PlanPath("event_timestamp"),
-		pbpath.PlanPath("user.user_id"),
-		pbpath.PlanPath("session.session_id"),
-	}
-
-	var opts []ba.Option
-	opts = append(opts, ba.WithHyperType(ht))
-	if denorm {
-		opts = append(opts, ba.WithDenormalizerPlan(paths...))
-	}
-
-	tc, err := ba.New(md, memory.DefaultAllocator, opts...)
-	if err != nil {
-		return err
-	}
-	defer tc.Release()
-
-	var totalMsgs int64
-	var wg sync.WaitGroup
-
-	// Consumer goroutine
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.Consume(ctx, cfg.Topic, func(msg *stream.Msg) error {
-			start := time.Now()
-			var err error
-			if denorm {
-				err = tc.AppendDenormRaw(msg.Payload)
-			} else {
-				err = tc.AppendRaw(msg.Payload)
-			}
-			if err != nil {
-				return err
-			}
-			metrics.RecordLatency("consume", start)
-			metrics.RecordThroughput(int64(len(msg.Payload)), 1)
-			msgCount := atomic.AddInt64(&totalMsgs, 1)
-
-			if msgCount%int64(batchSize) == 0 {
-				startBatch := time.Now()
-				var rec arrow.Record
-				if denorm {
-					rec = tc.NewDenormalizerRecordBatch()
-				} else {
-					rec = tc.NewRecordBatch()
-				}
-				
-				// Record detailed metrics
-				metrics.RecordBatchMetrics(int(rec.NumRows()), int(rec.NumCols()), 0, int(rec.NumRows()))
-				metrics.RecordLatency("batch_output", startBatch)
-				rec.Release()
-			}
-			return nil
+	switch *mode {
+	case "stream":
+		result, err := runStreamExperiment(ctx, streamExperimentConfig{
+			Rate:        *rate,
+			Workers:     *workers,
+			Duration:    *duration,
+			BatchSize:   *batchSize,
+			SizeDist:    *sizeDist,
+			EnableHyper: *hyper,
+			Denorm:      *denorm,
 		})
-	}()
-
-	// Producer loop
-	producerRate := rate
-	interval := time.Second / time.Duration(producerRate)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	start := time.Now()
-	deadline := start.Add(duration)
-
-	// Initialize WireProducer to generate realistic data based on sizeDist
-	wp := producer.NewWireProducer(nil, cfg, producer.WireConfig{
-		SizeDist: sizeDist,
-	})
-
-loop:
-	for {
-		select {
-		case <-ctx.Done():
-			break loop
-		case <-ticker.C:
-			if time.Now().After(deadline) {
-				break loop
-			}
-			evt := wp.GenerateWireMessage()
-			raw, _ := proto.Marshal(evt)
-			
-			publishStart := time.Now()
-			p.Publish(ctx, cfg.Topic, &stream.Msg{Payload: raw})
-			metrics.RecordLatency("produce", publishStart)
+		if err != nil {
+			return err
 		}
+		printExperimentResult(result)
+		return nil
+	case "stress":
+		return runStressCollapse(ctx, stressConfig{
+			Workers:     *workers,
+			Duration:    *duration,
+			BatchSize:   *batchSize,
+			SizeDist:    *sizeDist,
+			EnableHyper: *hyper,
+			Denorm:      *denorm,
+			MaxRate:     *maxRate,
+		})
+	default:
+		result, err := runDirectPipeline(ctx, directPipelineConfig{
+			Mode:        "direct",
+			Rate:        *rate,
+			Workers:     *workers,
+			Duration:    *duration,
+			Messages:    0,
+			BatchSize:   *batchSize,
+			SizeDist:    *sizeDist,
+			EnableHyper: *hyper,
+			Denorm:      *denorm,
+		})
+		if err != nil {
+			return err
+		}
+		printExperimentResult(result)
+		return nil
 	}
-
-	time.Sleep(2 * time.Second) // Let consumer catch up
-	
-	elapsed := time.Since(start)
-	rateCalc := float64(atomic.LoadInt64(&totalMsgs)) / elapsed.Seconds()
-
-	fmt.Printf("Experiment Results (NATS):\n")
-	fmt.Printf("  Mode: stream\n")
-	fmt.Printf("  Duration: %v\n", elapsed)
-	fmt.Printf("  Messages: %d\n", atomic.LoadInt64(&totalMsgs))
-	fmt.Printf("  Rate: %.2f msg/s\n", rateCalc)
-
-	return nil
 }
 
-func runChaos(ctx context.Context) error {
+func runChaos(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("chaos", flag.ExitOnError)
 	rate := fs.Int("rate", 1000, "Base messages per second")
 	mode := fs.String("mode", "steady", "Mode: steady, burst")
@@ -535,166 +275,545 @@ func runChaos(ctx context.Context) error {
 	hyper := fs.Bool("hyper", true, "Enable HyperType")
 	workers := fs.Int("workers", runtime.NumCPU(), "Workers")
 	duration := fs.Duration("duration", 30*time.Second, "Chaos test duration")
-
-	args := os.Args[2:]
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, *duration)
+	injector := chaos.NewInjector(chaos.Config{
+		BurstEnabled:         *chaosBurst,
+		BurstInterval:        10 * time.Second,
+		BurstFactorMin:       10,
+		BurstFactorMax:       100,
+		BurstProbability:     0.2,
+		SchemaEvolution:      *chaosSchema,
+		SchemaVersions:       []string{"1.0.0", "1.1.0", "2.0.0"},
+		SchemaSwapInterval:   30 * time.Second,
+		HotPartitionEnabled:  *chaosHotPartition,
+		HotPartitionRatio:    0.2,
+		HotPartitionCount:    3,
+		SizeShockEnabled:     *chaosSizeShock,
+		SizeShockInterval:    15 * time.Second,
+		SizeShockProbability: 0.1,
+	})
+
+	result, err := runStreamExperiment(ctx, streamExperimentConfig{
+		Rate:        *rate,
+		Workers:     *workers,
+		Duration:    *duration,
+		BatchSize:   1000,
+		SizeDist:    *sizeDist,
+		EnableHyper: *hyper,
+		Denorm:      true,
+		Mode:        *mode,
+		BurstFactor: *burstFactor,
+		Injector:    injector,
+	})
+	if err != nil {
+		return err
+	}
+	inj, bursts, swaps, shocks := injector.Stats()
+	fmt.Printf("Chaos Results:\n")
+	fmt.Printf("  Mode: %s\n", *mode)
+	fmt.Printf("  Duration: %v\n", result.Duration)
+	fmt.Printf("  Messages (Consumed): %d\n", result.Messages)
+	fmt.Printf("  Injections: %d\n", inj)
+	fmt.Printf("  Bursts: %d\n", bursts)
+	fmt.Printf("  Schema Swaps: %d\n", swaps)
+	fmt.Printf("  Size Shocks: %d\n", shocks)
+	return nil
+}
+
+type directPipelineConfig struct {
+	Mode        string
+	Rate        int
+	Workers     int
+	Duration    time.Duration
+	Messages    int
+	BatchSize   int
+	SizeDist    string
+	EnableHyper bool
+	Denorm      bool
+	FixedSize   int
+}
+
+func runDirectPipeline(parent context.Context, cfg directPipelineConfig) (*ExperimentResult, error) {
+	metrics.Reset()
+
+	base, err := newTranscoder(cfg.EnableHyper, cfg.Denorm)
+	if err != nil {
+		return nil, err
+	}
+	defer base.Release()
+
+	transcoders := make([]*ba.Transcoder, 0, cfg.Workers)
+	transcoders = append(transcoders, base)
+	for i := 1; i < cfg.Workers; i++ {
+		clone, cloneErr := base.Clone(memory.NewGoAllocator())
+		if cloneErr != nil {
+			return nil, cloneErr
+		}
+		transcoders = append(transcoders, clone)
+	}
+	defer func() {
+		for _, tc := range transcoders[1:] {
+			tc.Release()
+		}
+	}()
+
+	runCtx := parent
+	cancel := func() {}
+	if cfg.Duration > 0 {
+		runCtx, cancel = context.WithTimeout(parent, cfg.Duration)
+	}
 	defer cancel()
 
-	cfg := config.Load()
+	var produced atomic.Int64
+	var producedBytes atomic.Int64
+	var workerErrors atomic.Int64
+	var nextIndex atomic.Int64
 
-	p, err := stream.NewProducer(cfg)
-	if err != nil {
-		return fmt.Errorf("create producer: %w", err)
+	start := time.Now()
+	var wg sync.WaitGroup
+	for workerID := 0; workerID < cfg.Workers; workerID++ {
+		wg.Add(1)
+		go func(tc *ba.Transcoder, workerIndex int) {
+			defer wg.Done()
+			wp := producer.NewWireProducer(nil, config.Load(), producer.WireConfig{SizeDist: cfg.SizeDist})
+			pending := 0
+
+			process := func(evt *pb.Event) bool {
+				raw, marshalErr := proto.Marshal(evt)
+				if marshalErr != nil {
+					workerErrors.Add(1)
+					return false
+				}
+				startConsume := time.Now()
+				var appendErr error
+				if cfg.Denorm {
+					appendErr = tc.AppendDenormRaw(raw)
+				} else {
+					appendErr = tc.AppendRaw(raw)
+				}
+				if appendErr != nil {
+					workerErrors.Add(1)
+					return false
+				}
+				metrics.RecordLatency("consume", startConsume)
+				metrics.RecordConsumedThroughput(int64(len(raw)), 1)
+				produced.Add(1)
+				producedBytes.Add(int64(len(raw)))
+				pending++
+				if pending >= cfg.BatchSize {
+					recordDirectBatch(tc, cfg.Denorm, pending)
+					pending = 0
+				}
+				return true
+			}
+
+			if cfg.Messages > 0 {
+				for {
+					index := int(nextIndex.Add(1) - 1)
+					if index >= cfg.Messages {
+						break
+					}
+					evt := wp.GenerateWireMessage()
+					if cfg.FixedSize > 0 {
+						evt.Payload = &pb.Event_Payload{EventType: "benchmark", RawData: make([]byte, cfg.FixedSize)}
+					}
+					process(evt)
+				}
+			} else {
+				interval := perWorkerInterval(cfg.Rate, cfg.Workers)
+				ticker := time.NewTicker(interval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-runCtx.Done():
+						if pending > 0 {
+							recordDirectBatch(tc, cfg.Denorm, pending)
+						}
+						return
+					case <-ticker.C:
+						evt := wp.GenerateWireMessage()
+						if cfg.FixedSize > 0 {
+							evt.Payload = &pb.Event_Payload{EventType: "benchmark", RawData: make([]byte, cfg.FixedSize)}
+						}
+						process(evt)
+					}
+				}
+			}
+
+			if pending > 0 {
+				recordDirectBatch(tc, cfg.Denorm, pending)
+			}
+		}(transcoders[workerID], workerID)
 	}
-	defer p.Close()
 
-	s, err := stream.NewConsumer(cfg)
-	if err != nil {
-		return fmt.Errorf("create consumer: %w", err)
+	wg.Wait()
+	elapsed := time.Since(start)
+	if cfg.Duration > 0 {
+		elapsed = cfg.Duration
 	}
-	defer s.Close()
 
+	report := metrics.GenerateTelemetryReport()
+	return &ExperimentResult{
+		Mode:       cfg.Mode,
+		Duration:   elapsed,
+		Messages:   produced.Load(),
+		Bytes:      producedBytes.Load(),
+		Errors:     workerErrors.Load(),
+		Report:     report,
+		RatePerSec: float64(produced.Load()) / elapsed.Seconds(),
+	}, nil
+}
+
+type streamExperimentConfig struct {
+	Rate        int
+	Workers     int
+	Duration    time.Duration
+	BatchSize   int
+	SizeDist    string
+	EnableHyper bool
+	Denorm      bool
+	Mode        string
+	BurstFactor int
+	Injector    *chaos.Injector
+}
+
+func runStreamExperiment(parent context.Context, cfg streamExperimentConfig) (*ExperimentResult, error) {
+	metrics.Reset()
+
+	appCfg := config.Load()
+	runID := time.Now().UnixNano()
+	appCfg.StreamName = fmt.Sprintf("ARROWFLOW_EXP_%d", runID)
+	appCfg.Topic = fmt.Sprintf("arrowflow.test.%d", runID)
+	appCfg.ConsumerGroup = fmt.Sprintf("arrowflow-exp-%d", runID)
+	appCfg.ConsumerStartAtNew = false
+
+	pub, err := stream.NewProducer(appCfg)
+	if err != nil {
+		return nil, fmt.Errorf("create producer: %w", err)
+	}
+	defer pub.Close()
+
+	sub, err := stream.NewConsumer(appCfg)
+	if err != nil {
+		return nil, fmt.Errorf("create consumer: %w", err)
+	}
+	defer sub.Close()
+
+	wireConsumer, err := consumer.NewWireConsumer(sub, appCfg, consumer.ConsumerConfig{
+		Workers:     cfg.Workers,
+		OutputMode:  outputMode(cfg.Denorm),
+		BatchSize:   cfg.BatchSize,
+		EnableHyper: cfg.EnableHyper,
+		DenormPaths: consumer.DefaultConsumerConfig.DenormPaths,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer wireConsumer.Close()
+
+	consumeCtx, cancelConsumer := context.WithCancel(parent)
+	defer cancelConsumer()
+
+	consumeErrCh := make(chan error, 1)
+	go func() {
+		consumeErrCh <- wireConsumer.Run(consumeCtx)
+	}()
+
+	if cfg.Injector != nil {
+		cfg.Injector.Start(consumeCtx)
+	}
+
+	produceCtx, cancelProduce := context.WithTimeout(parent, cfg.Duration)
+	defer cancelProduce()
+
+	producerWorkers := max(1, min(cfg.Workers, max(cfg.Rate/20000, 1)))
+	start := time.Now()
+	var produced atomic.Int64
+	var producedBytes atomic.Int64
+	errCh := make(chan error, producerWorkers)
+	var wg sync.WaitGroup
+
+	for workerID := 0; workerID < producerWorkers; workerID++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+
+			wp := producer.NewWireProducer(pub, appCfg, producer.WireConfig{
+				Mode:          cfg.Mode,
+				Rate:          rateShare(cfg.Rate, worker, producerWorkers),
+				BurstFactor:   max(cfg.BurstFactor, 1),
+				BurstDuration: 5 * time.Second,
+				SizeDist:      cfg.SizeDist,
+				SchemaVersion: "1.0.0",
+			})
+			if cfg.Injector != nil {
+				wp.AttachInjector(cfg.Injector)
+			}
+
+			ticker := time.NewTicker(10 * time.Millisecond)
+			defer ticker.Stop()
+
+			carry := 0.0
+			baseRate := rateShare(cfg.Rate, worker, producerWorkers)
+			for {
+				select {
+				case <-produceCtx.Done():
+					return
+				case <-ticker.C:
+					targetRate := baseRate
+					if cfg.Injector != nil {
+						targetRate = cfg.Injector.ApplyRate(baseRate)
+					}
+					carry += float64(targetRate) * tickerIntervalSeconds(ticker)
+					toSend := int(carry)
+					carry -= float64(toSend)
+					for i := 0; i < toSend; i++ {
+						evt := wp.GenerateWireMessage()
+						raw, marshalErr := proto.Marshal(evt)
+						if marshalErr != nil {
+							continue
+						}
+						startPublish := time.Now()
+						if err := pub.Publish(produceCtx, appCfg.Topic, &stream.Msg{Payload: raw}); err != nil {
+							if produceCtx.Err() != nil {
+								return
+							}
+							select {
+							case errCh <- err:
+							default:
+							}
+							cancelProduce()
+							return
+						}
+						metrics.RecordLatency("produce", startPublish)
+						metrics.RecordProducedThroughput(int64(len(raw)), 1)
+						produced.Add(1)
+						producedBytes.Add(int64(len(raw)))
+					}
+				}
+			}
+		}(workerID)
+	}
+
+	wg.Wait()
+	select {
+	case produceErr := <-errCh:
+		cancelConsumer()
+		return nil, produceErr
+	default:
+	}
+
+	produceElapsed := time.Since(start)
+	waitForDrain(wireConsumer, produced.Load(), 10*time.Second)
+	cancelConsumer()
+	if consumeErr := <-consumeErrCh; consumeErr != nil {
+		return nil, consumeErr
+	}
+
+	msgs, bytes, errs, _, _ := wireConsumer.Stats()
+	report := metrics.GenerateTelemetryReport()
+	return &ExperimentResult{
+		Mode:       "stream",
+		Duration:   produceElapsed,
+		Messages:   msgs,
+		Bytes:      bytes,
+		Errors:     errs,
+		Report:     report,
+		RatePerSec: float64(msgs) / produceElapsed.Seconds(),
+	}, nil
+}
+
+type stressConfig struct {
+	Workers     int
+	Duration    time.Duration
+	BatchSize   int
+	SizeDist    string
+	EnableHyper bool
+	Denorm      bool
+	MaxRate     int
+}
+
+func runStressCollapse(ctx context.Context, cfg stressConfig) error {
+	rates := []int{1000, 5000, 10000, 25000, 50000, 75000, 100000}
+	for _, rate := range rates {
+		if rate > cfg.MaxRate {
+			continue
+		}
+		result, err := runDirectPipeline(ctx, directPipelineConfig{
+			Mode:        "stress",
+			Rate:        rate,
+			Workers:     cfg.Workers,
+			Duration:    cfg.Duration,
+			BatchSize:   cfg.BatchSize,
+			SizeDist:    cfg.SizeDist,
+			EnableHyper: cfg.EnableHyper,
+			Denorm:      cfg.Denorm,
+		})
+		if err != nil {
+			return err
+		}
+		fmt.Printf("Stress Results:\n")
+		fmt.Printf("  Rate Input: %d\n", rate)
+		printExperimentResult(result)
+	}
+	return nil
+}
+
+func printExperimentResult(result *ExperimentResult) {
+	fmt.Printf("Experiment Results:\n")
+	fmt.Printf("  Mode: %s\n", result.Mode)
+	fmt.Printf("  Duration: %v\n", result.Duration)
+	fmt.Printf("  Messages: %d\n", result.Messages)
+	fmt.Printf("  Rate: %.2f msg/s\n", result.RatePerSec)
+}
+
+func writeTelemetry(report metrics.TelemetryReport) {
+	data, err := report.ToJSON()
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile("telemetry.json", data, 0o644)
+}
+
+func newTranscoder(enableHyper, denorm bool) (*ba.Transcoder, error) {
 	protoPath := findProtoPath()
 	protoDir := filepath.Dir(protoPath)
 	protoFile := filepath.Base(protoPath)
 
 	fd, err := ba.CompileProtoToFileDescriptor(protoFile, []string{protoDir})
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("compile proto: %w", err)
 	}
 	md, err := ba.GetMessageDescriptorByName(fd, "Event")
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("get descriptor: %w", err)
 	}
 
-	var ht *ba.HyperType
-	if *hyper {
-		ht = ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))
+	var opts []ba.Option
+	if enableHyper {
+		opts = append(opts, ba.WithHyperType(ba.NewHyperType(md, ba.WithAutoRecompile(100_000, 0.01))))
+	}
+	if denorm {
+		opts = append(opts, ba.WithDenormalizerPlan(
+			pbpath.PlanPath("schema_version"),
+			pbpath.PlanPath("event_timestamp"),
+			pbpath.PlanPath("user.user_id"),
+			pbpath.PlanPath("session.session_id"),
+			pbpath.PlanPath("tracing.trace_id"),
+			pbpath.PlanPath("payload.event_type"),
+			pbpath.PlanPath("metrics[*].name"),
+			pbpath.PlanPath("tags[*].key"),
+		))
 	}
 
-	paths := []pbpath.PlanPathSpec{
-		pbpath.PlanPath("schema_version"),
-		pbpath.PlanPath("event_timestamp"),
-		pbpath.PlanPath("user.user_id"),
-		pbpath.PlanPath("session.session_id"),
+	return ba.New(md, memory.DefaultAllocator, opts...)
+}
+
+func recordDirectBatch(tc *ba.Transcoder, denorm bool, inputMessages int) {
+	startBatch := time.Now()
+	var rec arrow.RecordBatch
+	if denorm {
+		rec = tc.NewDenormalizerRecordBatch()
+	} else {
+		rec = tc.NewRecordBatch()
 	}
+	metrics.RecordLatency("batch_output", startBatch)
+	defer rec.Release()
 
-	tc, err := ba.New(md, memory.DefaultAllocator, ba.WithHyperType(ht), ba.WithDenormalizerPlan(paths...))
-	if err != nil {
-		return err
+	if rec.NumRows() == 0 {
+		return
 	}
-	defer tc.Release()
+	metrics.RecordBatchMetrics(int(rec.NumRows()), int(rec.NumCols()), recordBatchSize(rec), inputMessages)
+}
 
-	injector := chaos.NewInjector(chaos.Config{
-		BurstEnabled:        *chaosBurst,
-		BurstInterval:       10 * time.Second,
-		BurstFactorMin:      10,
-		BurstFactorMax:      100,
-		SchemaEvolution:     *chaosSchema,
-		SchemaVersions:      []string{"1.0.0", "1.1.0", "2.0.0"},
-		SchemaSwapInterval:  30 * time.Second,
-		HotPartitionEnabled: *chaosHotPartition,
-		HotPartitionRatio:   0.2,
-		HotPartitionCount:   3,
-		SizeShockEnabled:    *chaosSizeShock,
-		SizeShockInterval:   15 * time.Second,
-	})
-	injector.Start(ctx)
-
-	var totalMsgsConsumed int64
-	var wg sync.WaitGroup
-
-	// Background consumer
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.Consume(ctx, cfg.Topic, func(msg *stream.Msg) error {
-			start := time.Now()
-			if err := tc.AppendDenormRaw(msg.Payload); err != nil {
-				return err
-			}
-			metrics.RecordLatency("consume", start)
-			atomic.AddInt64(&totalMsgsConsumed, 1)
-
-			if atomic.LoadInt64(&totalMsgsConsumed)%1000 == 0 {
-				startBatch := time.Now()
-				rec := tc.NewDenormalizerRecordBatch()
-				metrics.RecordLatency("batch_output", startBatch)
-				rec.Release()
-			}
-			return nil
-		})
-	}()
-
-	wc := producer.WireConfig{
-		Mode:          *mode,
-		Rate:          *rate,
-		BurstFactor:   *burstFactor,
-		BurstDuration: 5 * time.Second,
-		SizeDist:      *sizeDist,
-		SchemaVersion: "1.0.0",
+func recordBatchSize(rec arrow.RecordBatch) int64 {
+	var total uint64
+	for _, col := range rec.Columns() {
+		total += col.Data().SizeInBytes()
 	}
+	return int64(total)
+}
 
-	prod := producer.NewWireProducer(p, cfg, wc)
-	log.Printf("Chaos Producer: rate=%d, mode=%s, workers=%d, hyper=%v", *rate, *mode, *workers, *hyper)
+func perWorkerInterval(rate, workers int) time.Duration {
+	if rate <= 0 {
+		return time.Microsecond
+	}
+	perWorker := rate / max(workers, 1)
+	if perWorker <= 0 {
+		perWorker = 1
+	}
+	interval := time.Second / time.Duration(perWorker)
+	if interval <= 0 {
+		return time.Microsecond
+	}
+	return interval
+}
 
-	err = prod.Run(ctx)
+func rateShare(total, worker, workers int) int {
+	if workers <= 1 {
+		return total
+	}
+	share := total / workers
+	if worker < total%workers {
+		share++
+	}
+	return share
+}
 
-	time.Sleep(2 * time.Second) // Let consumer catch up
+func tickerIntervalSeconds(ticker *time.Ticker) float64 {
+	return 0.01
+}
 
-	msgs, bytes, _, _ := prod.Stats()
-	inj, bursts, swaps, _ := injector.Stats()
+func outputMode(denorm bool) string {
+	if denorm {
+		return "denorm"
+	}
+	return "nested"
+}
 
-	fmt.Printf("Chaos Results:\n")
-	fmt.Printf("  Messages (Produced): %d\n", msgs)
-	fmt.Printf("  Messages (Consumed): %d\n", atomic.LoadInt64(&totalMsgsConsumed))
-	fmt.Printf("  Bytes: %d\n", bytes)
-	fmt.Printf("  Injections: %d\n", inj)
-	fmt.Printf("  Bursts: %d\n", bursts)
-	fmt.Printf("  Schema Swaps: %d\n", swaps)
-	return nil
+func waitForDrain(cons *consumer.WireConsumer, produced int64, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		msgs, _, _, _, _ := cons.Stats()
+		report := metrics.GenerateTelemetryReport()
+		if msgs >= produced && report.Streaming.ConsumerLag == 0 && report.Streaming.BufferDepth == 0 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func findProtoPath() string {
-	// Check common locations relative to binary and current dir
 	searchPaths := []string{
 		"./internal/schemas/event.proto",
 		"internal/schemas/event.proto",
 		"../internal/schemas/event.proto",
-		"cmd/arrowflow/internal/schemas/event.proto",
 	}
 
-	// Also check absolute paths from known project locations
-	exePath, err := os.Executable()
-	if err == nil {
-		exeDir := filepath.Dir(exePath)
-		searchPaths = append(searchPaths,
-			filepath.Join(exeDir, "internal/schemas/event.proto"),
-			filepath.Join(exeDir, "..", "internal/schemas/event.proto"),
-			filepath.Join(exeDir, "..", "..", "internal/schemas/event.proto"),
-		)
-	}
-
-	for _, p := range searchPaths {
-		if _, err := os.Stat(p); err == nil {
-			absPath, _ := filepath.Abs(p)
-			log.Printf("Found proto at: %s", absPath)
+	for _, path := range searchPaths {
+		if _, err := os.Stat(path); err == nil {
+			absPath, _ := filepath.Abs(path)
 			return absPath
 		}
 	}
 
-	// Fallback - try current working dir
 	cwd, _ := os.Getwd()
-	fallback := filepath.Join(cwd, "internal/schemas/event.proto")
-	log.Printf("Using fallback proto path: %s", fallback)
-	return fallback
+	return filepath.Join(cwd, "internal/schemas/event.proto")
 }
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-	runtime.GOMAXPROCS(runtime.NumCPU())
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

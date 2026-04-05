@@ -2,18 +2,26 @@ package producer
 
 import (
 	"context"
-	"crypto/rand"
 	"log"
-	"math/big"
+	mrand "math/rand"
+	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/TFMV/arrowflow/internal/chaos"
 	"github.com/TFMV/arrowflow/internal/config"
 	"github.com/TFMV/arrowflow/internal/metrics"
 	pb "github.com/TFMV/arrowflow/internal/schemas/pb"
 	"github.com/TFMV/arrowflow/internal/stream"
 	"google.golang.org/protobuf/proto"
 )
+
+var rngPool = sync.Pool{
+	New: func() any {
+		return mrand.New(mrand.NewSource(time.Now().UnixNano()))
+	},
+}
 
 type Mode int
 
@@ -44,6 +52,7 @@ type WireProducer struct {
 	burstFactor   int
 	burstDuration time.Duration
 	schemaVersion string
+	injector      *chaos.Injector
 
 	stats struct {
 		messages atomic.Int64
@@ -134,6 +143,10 @@ func (wp *WireProducer) Run(ctx context.Context) error {
 	}
 }
 
+func (wp *WireProducer) AttachInjector(injector *chaos.Injector) {
+	wp.injector = injector
+}
+
 func (wp *WireProducer) runSteady(ctx context.Context) error {
 	interval := time.Second / time.Duration(wp.rate)
 	ticker := time.NewTicker(interval)
@@ -144,7 +157,7 @@ func (wp *WireProducer) runSteady(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := wp.emitBatch(1); err != nil {
+			if err := wp.emitBatch(ctx, wp.effectiveBatchCount(1)); err != nil {
 				return err
 			}
 		}
@@ -177,7 +190,7 @@ func (wp *WireProducer) runBurst(ctx context.Context) error {
 				case <-ctx.Done():
 					return ctx.Err()
 				case <-time.After(burstInterval):
-					if err := wp.emitBatch(wp.burstFactor); err != nil {
+					if err := wp.emitBatch(ctx, wp.effectiveBatchCount(wp.burstFactor)); err != nil {
 						return err
 					}
 				}
@@ -186,7 +199,7 @@ func (wp *WireProducer) runBurst(ctx context.Context) error {
 				case <-ctx.Done():
 					return ctx.Err()
 				case <-steadyTicker.C:
-					if err := wp.emitBatch(1); err != nil {
+					if err := wp.emitBatch(ctx, wp.effectiveBatchCount(1)); err != nil {
 						return err
 					}
 				}
@@ -214,7 +227,7 @@ func (wp *WireProducer) runSinusoidal(ctx context.Context) error {
 			}
 
 			for i := 0; i < rate/100; i++ {
-				if err := wp.emitBatch(1); err != nil {
+				if err := wp.emitBatch(ctx, wp.effectiveBatchCount(1)); err != nil {
 					return err
 				}
 			}
@@ -234,9 +247,12 @@ func sinApprox(x float64) float64 {
 	return x - (x*x*x)/6 + (x*x*x*x*x)/120
 }
 
-func (wp *WireProducer) emitBatch(count int) error {
+func (wp *WireProducer) emitBatch(ctx context.Context, count int) error {
 	for i := 0; i < count; i++ {
 		msg := wp.GenerateWireMessage()
+		if wp.injector != nil {
+			msg.SchemaVersion = wp.injector.GetSchemaVersion()
+		}
 		wireBytes, err := proto.Marshal(msg)
 		if err != nil {
 			wp.stats.errors.Add(1)
@@ -244,8 +260,11 @@ func (wp *WireProducer) emitBatch(count int) error {
 		}
 
 		start := time.Now()
-		err = wp.publisher.Publish(wp.ctx, wp.topic, &stream.Msg{
-			Key:     []byte(generateKey()),
+		if wp.injector != nil {
+			wp.injector.ApplyLag(ctx)
+		}
+		err = wp.publisher.Publish(ctx, wp.topic, &stream.Msg{
+			Key:     []byte(wp.generateKey()),
 			Payload: wireBytes,
 		})
 		if err != nil {
@@ -255,6 +274,7 @@ func (wp *WireProducer) emitBatch(count int) error {
 		}
 
 		metrics.RecordLatency("produce", start)
+		metrics.RecordProducedThroughput(int64(len(wireBytes)), 1)
 		wp.stats.messages.Add(1)
 		wp.stats.bytes.Add(int64(len(wireBytes)))
 	}
@@ -296,8 +316,18 @@ func (wp *WireProducer) GenerateWireMessage() *pb.Event {
 		cfg.LargePayloadProb = 0.1
 	}
 
+	if wp.injector != nil && wp.injector.ShouldApplySizeShock() {
+		cfg.LargePayloadProb = 1
+		cfg.NumMetrics = maxInt(cfg.NumMetrics, 20)
+		cfg.NumTags = maxInt(cfg.NumTags, 40)
+	}
+
 	evt := genEvent(cfg)
-	evt.SchemaVersion = wp.schemaVersion
+	if wp.injector != nil {
+		evt.SchemaVersion = wp.injector.GetSchemaVersion()
+	} else {
+		evt.SchemaVersion = wp.schemaVersion
+	}
 	return evt
 }
 
@@ -361,24 +391,27 @@ func genEvent(cfg StressConfig) *pb.Event {
 }
 
 func should(prob float32) bool {
-	n, _ := rand.Int(rand.Reader, big.NewInt(10000))
-	return int(n.Int64()) < int(prob*10000)
+	rng := rngPool.Get().(*mrand.Rand)
+	defer rngPool.Put(rng)
+	return rng.Intn(10000) < int(prob*10000)
 }
 
 func randInt(min, max int) int {
 	if max <= min {
 		return min
 	}
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min)))
-	return int(n.Int64()) + min
+	rng := rngPool.Get().(*mrand.Rand)
+	defer rngPool.Put(rng)
+	return rng.Intn(max-min) + min
 }
 
 func randInt64(min, max int64) int64 {
 	if max <= min {
 		return min
 	}
-	n, _ := rand.Int(rand.Reader, big.NewInt(max-min))
-	return n.Int64() + min
+	rng := rngPool.Get().(*mrand.Rand)
+	defer rngPool.Put(rng)
+	return rng.Int63n(max-min) + min
 }
 
 func randFloat(min, max float64) float64 {
@@ -388,10 +421,11 @@ func randFloat(min, max float64) float64 {
 
 func randString(length int) string {
 	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	rng := rngPool.Get().(*mrand.Rand)
+	defer rngPool.Put(rng)
 	b := make([]byte, length)
 	for i := range b {
-		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(chars))))
-		b[i] = chars[n.Int64()]
+		b[i] = chars[rng.Intn(len(chars))]
 	}
 	return string(b)
 }
@@ -554,9 +588,10 @@ func genTags(count int) []*pb.Event_Tag {
 
 func generateKey() string {
 	const hotPartitions = 3
-	n, _ := rand.Int(rand.Reader, big.NewInt(100))
-	if n.Int64() < int64(float32(100)*0.2) {
-		return "hot-" + string('0'+byte(n.Int64()%int64(hotPartitions)))
+	rng := rngPool.Get().(*mrand.Rand)
+	defer rngPool.Put(rng)
+	if rng.Intn(100) < 20 {
+		return "hot-" + strconv.Itoa(rng.Intn(hotPartitions))
 	}
 	return "cold-" + randString(16)
 }
@@ -575,4 +610,33 @@ func (wp *WireProducer) Stats() (messages, bytes, errors, bursts int64) {
 func (wp *WireProducer) Close() error {
 	wp.cancel()
 	return wp.publisher.Close()
+}
+
+func (wp *WireProducer) effectiveBatchCount(base int) int {
+	if wp.injector == nil {
+		return base
+	}
+	effectiveRate := wp.injector.ApplyRate(wp.rate)
+	if wp.rate <= 0 || effectiveRate <= wp.rate {
+		return base
+	}
+	factor := effectiveRate / wp.rate
+	if factor < 1 {
+		factor = 1
+	}
+	return base * factor
+}
+
+func (wp *WireProducer) generateKey() string {
+	if wp.injector != nil {
+		return wp.injector.GenerateKey()
+	}
+	return generateKey()
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
